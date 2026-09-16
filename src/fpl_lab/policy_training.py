@@ -129,6 +129,7 @@ def _counterfactual_value(
     signal_cache: dict[int, list],
     context_store: ContextStore | None,
     horizon_gameweeks: int,
+    chip_transfer_depth: int = 5,
 ) -> tuple[float, float, float, float, float, int]:
     gameweek = int(row["gameweek"])
     squad_ids = [str(player_id) for player_id in row["pre_squad_ids"]]
@@ -166,6 +167,7 @@ def _counterfactual_value(
         max_transfer_depth=1,
         transfer_beam_width=3,
         transfer_candidate_width=6,
+        chip_transfer_depth=chip_transfer_depth,
     )
     # A small, fixed financial term keeps the target strategic without letting
     # price movement overwhelm realized FPL points. The coefficient is held
@@ -194,6 +196,7 @@ def collect_counterfactual_examples(
     candidate_width: int = 12,
     max_states: int | None = None,
     continuation_policy: str = "hold",
+    chip_transfer_depth: int = 5,
 ) -> list[CounterfactualExample]:
     """Turn a legal simulator trajectory into action-value examples."""
 
@@ -231,6 +234,7 @@ def collect_counterfactual_examples(
             signals,
             candidate_width=candidate_width,
             chips_available=chips_available,
+            chip_transfer_depth=chip_transfer_depth,
         )
         state = policy_state_from_runtime(
             current,
@@ -257,6 +261,7 @@ def collect_counterfactual_examples(
                 signal_cache,
                 context_store,
                 horizon_gameweeks,
+                chip_transfer_depth,
             )
             examples.append(
                 CounterfactualExample(

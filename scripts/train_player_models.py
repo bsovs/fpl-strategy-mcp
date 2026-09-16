@@ -94,6 +94,14 @@ def main() -> None:
             )
             if column in raw
         },
+        "metadata_imputation_rate_by_season": {
+            season: {
+                "team": round(float(raw.loc[raw["season"].astype(str) == season, "metadata_team_imputed"].mean()), 6),
+                "position": round(float(raw.loc[raw["season"].astype(str) == season, "metadata_position_imputed"].mean()), 6),
+            }
+            for season in seasons
+            if "metadata_team_imputed" in raw and "metadata_position_imputed" in raw
+        },
         "development_seasons": list(development),
         "validation_season": args.validation_season,
         "evaluation_season": args.evaluation_season,

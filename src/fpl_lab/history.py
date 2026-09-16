@@ -47,6 +47,7 @@ def download_seasons(
                 destination.write_bytes(payload)
             manifest["files"].append(
                 {
+                    "kind": "gameweek",
                     "season": season,
                     "gameweek": gameweek,
                     "url": url,
@@ -55,6 +56,32 @@ def download_seasons(
                     "bytes": len(payload),
                 }
             )
+        # The earliest Vaastav GW exports do not carry position/team columns.
+        # Keep the raw GW files immutable but also fetch the season metadata
+        # needed to recover the player universe instead of silently dropping
+        # those seasons during feature construction.
+        metadata_relative = f"{season}/players_raw.csv"
+        metadata_destination = root / metadata_relative
+        if metadata_destination.exists():
+            metadata_payload = metadata_destination.read_bytes()
+        else:
+            request = Request(
+                f"{VAASTAV_RAW}/{metadata_relative}",
+                headers={"User-Agent": "fpl-regression-local/0.1"},
+            )
+            with urlopen(request, timeout=timeout) as response:
+                metadata_payload = response.read()
+            metadata_destination.write_bytes(metadata_payload)
+        manifest["files"].append(
+            {
+                "kind": "players_raw",
+                "season": season,
+                "url": f"{VAASTAV_RAW}/{metadata_relative}",
+                "path": str(metadata_destination),
+                "sha256": _sha256_bytes(metadata_payload),
+                "bytes": len(metadata_payload),
+            }
+        )
     manifest_path = root / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return manifest

@@ -79,6 +79,27 @@ class FplLabTests(unittest.TestCase):
             loaded = load_vaastav_gameweeks(directory, ["2020-21"])
             self.assertEqual(loaded.iloc[0]["name"], "José")
 
+    def test_player_history_loader_restores_early_metadata_with_flags(self):
+        from fpl_lab.player_models import load_vaastav_gameweeks
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "2016-17" / "gws"
+            path.mkdir(parents=True)
+            (path / "gw1.csv").write_text(
+                "name,element,opponent_team,kickoff_time,was_home,total_points\n"
+                "Player,7,2,2016-08-01T12:00:00Z,True,6\n",
+                encoding="utf-8",
+            )
+            (Path(directory) / "2016-17" / "players_raw.csv").write_text(
+                "id,element_type,team\n7,3,11\n",
+                encoding="utf-8",
+            )
+            loaded = load_vaastav_gameweeks(directory, ["2016-17"])
+            self.assertEqual(loaded.iloc[0]["position"], "MID")
+            self.assertEqual(loaded.iloc[0]["team"], 11)
+            self.assertEqual(loaded.iloc[0]["metadata_position_imputed"], 1.0)
+            self.assertEqual(loaded.iloc[0]["metadata_team_imputed"], 1.0)
+
     def test_player_features_are_lagged_and_archive_labels_are_normalized(self):
         raw = pd.DataFrame(
             [
@@ -105,6 +126,19 @@ class FplLabTests(unittest.TestCase):
         self.assertTrue(gw1["points_mean_5"].isna().all())
         self.assertTrue(gw1["total_points_last"].isna().all())
         self.assertEqual(features.iloc[-1]["total_points_last"], 1)
+
+    def test_extended_features_carry_prior_season_player_history_without_leakage(self):
+        raw = pd.DataFrame(
+            [
+                {"name": "Player", "element": 7, "position": "MID", "team": 1, "opponent_team": 2, "kickoff_time": "2024-05-01T12:00:00Z", "was_home": True, "total_points": 9, "season": "2023-24", "season_order": 2023, "gameweek": 38},
+                {"name": "Player", "element": 7, "position": "MID", "team": 1, "opponent_team": 3, "kickoff_time": "2024-08-01T12:00:00Z", "was_home": False, "total_points": 2, "season": "2024-25", "season_order": 2024, "gameweek": 1},
+            ]
+        )
+        features = build_extended_player_feature_table(raw)
+        opening = features[features["season"] == "2024-25"].iloc[0]
+        self.assertTrue(pd.isna(opening["total_points_last"]))
+        self.assertEqual(opening["career_total_points_last"], 9)
+        self.assertEqual(opening["career_games_before"], 1)
 
     def test_decision_layer_scores_legal_same_position_move(self):
         current = [PlayerState("out", "Out", "MID", "A", 7.0, 6.9)]

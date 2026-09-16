@@ -70,21 +70,26 @@ These are player-fixture forecast errors, not proof of transfer profitability.
 The expanded local trainer now uses the complete public Vaastav archive from
 2016–17 through 2025–26. The temporal protocol is development on 2016–17
 through 2023–24, model selection on 2024–25, and an untouched final test on
-2025–26. It produces 163,082 player-fixture feature rows from 247,896 raw
-rows and uses 227 model inputs: lagged player form and volatility, minutes and
+2025–26. It produces 247,574 player-fixture feature rows from 247,896 raw
+rows and uses 286 model inputs: lagged player form and volatility, minutes and
 starts, ownership and transfer movement, price momentum, team/opponent and
-prior-matchup form, fixture-shape counts, and optional timestamped context.
-All player and team lags are guarded by season/gameweek sequence, which blocks
-double-gameweek result leakage.
+prior-matchup form, fixture-shape counts, leakage-safe cross-season player
+history, breakout-vs-career signals, and optional timestamped context. The
+oldest GW files are enriched from season-level `players_raw.csv` metadata;
+those rows carry explicit imputation flags because the roster snapshot is not
+a point-in-time transfer history. All player and team lags are guarded by
+season/gameweek sequence, which blocks double-gameweek result leakage.
 
-On the untouched 2025–26 test, the selected stronger-ridge forecast had RMSE
-1.947 and MAE 1.005, compared with MAE 1.038 for EWMA(5). Its top-20-per-
-gameweek selection had a realized mean of 4.274 points, compared with 3.695
-for EWMA(5). A separate next-price-change ridge had MAE 0.119 in the source
-price-tenth unit. The neural forecast candidate was trained and evaluated in
-the validation protocol, but was not selected because the regularized model
-performed better on 2024–25. This is an intended anti-overfitting result, not
-a reason to force a neural model into production.
+On the 2024–25 validation season, the career-feature neural candidate had
+MAE 1.026 while the stronger ridge had RMSE 1.930; the run selected the neural
+model on its primary MAE/ranking rule. On the untouched 2025–26 test, the
+selected neural forecast had RMSE 1.954, MAE 0.973, Spearman ranking 0.697,
+and a top-20-per-gameweek realized mean of 4.247 points, compared with 1.039
+MAE and 3.695 points for EWMA(5). A separate next-price-change ridge had MAE
+0.118 in the source price-tenth unit. The career-history ablation improved
+MAE and top-20 selection value but slightly reduced RMSE and Spearman, so it
+is retained as a research feature set rather than treated as a universal
+forecast winner.
 
 ### 2.2 Legal decision layer
 
@@ -118,11 +123,16 @@ override must clear an anchor tolerance and a risk/opportunity-cost gate.
 
 ### 2.4 MCP interface
 
-The server exposes two tools:
+The server exposes a prediction tool plus inspectable supporting tools:
 
 1. `fpl_recommend_moves` accepts the current state and returns legal actions.
-2. `fpl_strategy_info` reports the served champion, evaluation summary, sources,
-   and limitations.
+2. `fpl_lineup_plan` handles formation, XI, bench order, and captaincy.
+3. `fpl_search_players` and `fpl_forecast_signals` inspect the full player pool.
+4. `fpl_score_moves` applies explicit per-request weight overrides.
+5. `fpl_strategy_info` and `fpl_strategy_catalog` report the served model and
+   tuning contract.
+6. `fpl_backtest_strategy` evaluates supplied scenarios or Vaastav-format
+   historical replays.
 
 The default transport is local stdio. An optional Streamable HTTP transport is
 included for a deliberately configured remote endpoint. The HTTP listener is
@@ -131,17 +141,18 @@ deployment still requires HTTPS and an authentication/reverse-proxy policy.
 
 ## 3. Backtest protocol
 
-The action-policy experiment used an expanding temporal protocol:
+The current action-policy experiment uses an expanding temporal protocol:
 
-- development seasons: 2021–22, 2022–23, and 2023–24;
-- temporal validation folds: train on earlier seasons, validate on the next;
-- development starting squads: `points_optimal`, `value_balanced`, and
-  `template_proxy`;
-- untouched holdout season: 2024–25;
-- holdout starting squads: two random but legal squads;
-- learned-candidate selection: maximize the paired 95% lower confidence bound
-  against the free-transfer anchor;
-- holdout was not used for selection.
+- development seasons: 2016–17 through 2023–24;
+- model-selection season: 2024–25;
+- untouched evaluation season: 2025–26;
+- four legal opening families: `points`, `value`, `template`, and
+  `randomized_points`;
+- four sampled states per season and opening family for development labels;
+- six candidate actions per decision policy family and a three-gameweek label
+  horizon;
+- wildcard/free-hit training search depth 5 and final-test depth 15;
+- the final test season is not used for fitting or model selection.
 
 The simulator now also searches sequentially legal multi-transfer bundles for
 wildcard and free-hit actions up to the 15-player squad depth. Each step
@@ -154,17 +165,28 @@ not to establish a final public leaderboard.
 
 ## 4. Current results
 
-The development tournament contained six runs per candidate. The free-transfer
-anchor averaged 2,037.2 net points. The raw neural policy averaged 2,074.0;
-the selective-chip cocktail averaged 2,099.3. However, neither had a positive
-paired 95% lower confidence bound against the anchor. The selective-chip
-candidate's lower bound was −19.4 points.
+The larger career-feature action run generated 1,440 development and 176
+validation counterfactual examples. The default action ensemble was selected
+on validation (RMSE 7.105 versus 7.224 for the small ensemble; state-level
+argmax accuracy 37.5% versus 18.75%). On 2024–25, the neural policy averaged
+2,042.5 points across the four opening families versus 2,009.0 for the
+points-only free-transfer anchor. This advantage was not uniform: one value
+opening favored the anchor, so the result is not a deployment guarantee.
 
-On the two-run untouched holdout, the anchor averaged 2,001.0 points and the
-raw neural policy averaged 1,960.5, a −40.5 mean difference. The sample is far
-too small for a definitive statistical conclusion, but it supports the current
-deployment choice: use the anchor unless a future, larger walk-forward study
-demonstrates a robust improvement.
+On the untouched 2025–26 replay, the neural policy averaged 2,058.75 points
+versus 1,929.5 for that run's anchor, with paired gains of 127, 96, 105, and
+189 points across the four opening families. The best neural opening scored
+2,111 points. This is encouraging as a policy-layer integration result, but
+it remains 302 points below the 2,413 research target and is based on one
+held-out season with synthetic opening squads. The artifact is therefore not
+promoted to the public MCP champion yet.
+
+The anchored cocktail was also replayed with the same action model and legal
+search. It averaged 2,047.5 on validation and 1,931.5 on 2025–26, versus the
+neural policy's 2,058.75 on that test. In this run the default gate was too
+permissive around repeated transfers and did not improve the held-out result;
+the transparent anchor remains the safer deployed fallback while gate tuning
+is treated as a separate validation-only experiment.
 
 The result also illustrates why “the neural network scored more on average” is
 not enough. The action space is path-dependent, chip timing has opportunity
@@ -172,17 +194,15 @@ cost, and model errors compound over a season. A strategy can win a few
 simulations while having an unacceptable downside or unstable behavior across
 starting squads.
 
-The current expanded forecast layer has not yet produced a validated
-2,413-point strategy. The 2,413 figure is therefore treated as a strategy
-benchmark/aspiration, not as a supervised player-point label. Clearing it
-requires a full-season legal replay with chips, formation, captaincy,
-multi-transfer bundles, price economics, and a held-out family of starting
-squads; a player forecast that ranks well is not sufficient. In a first
-2025–26 bridge smoke test, the expanded forecasts produced 1,942–1,992 net
-points across three legal starting-squad modes under the same free-transfer
-policy, versus 1,789–1,807 for the legacy signals. The shipped action cocktail
-with chips scored 1,982 on the template start. These are useful integration
-checks, not tuned final results, and none clears 2,413.
+The current expanded forecast and action layers have not yet produced a
+validated 2,413-point strategy. The 2,413 figure is therefore treated as a
+strategy benchmark/aspiration, not as a supervised player-point label.
+Clearing it requires more historical action states, stronger expected-minutes
+and multi-horizon fixture forecasts, a real league/rival model, and held-out
+families of starting squads; a player forecast that ranks well is not
+sufficient. A forecast-driven legal opening squad was also tested separately
+with the trained policy and scored 2,097 on 2025–26, so simply changing the
+opening optimizer did not close the gap.
 
 ## 5. News, social context, and price information
 

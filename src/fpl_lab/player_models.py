@@ -86,7 +86,61 @@ def load_vaastav_gameweeks(root: str | Path, seasons: Iterable[str]) -> pd.DataF
             frames.append(frame)
     if not frames:
         raise ValueError(f"no Vaastav gameweek files found under {root}")
-    return pd.concat(frames, ignore_index=True, sort=False)
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    return _enrich_historical_metadata(combined, root)
+
+
+def _enrich_historical_metadata(frame: pd.DataFrame, root: str | Path) -> pd.DataFrame:
+    """Recover missing early-season team/position fields with provenance.
+
+    Vaastav's oldest GW exports predate the merged player columns and contain
+    ``element`` but no position or team. ``players_raw.csv`` is the available
+    season-level roster snapshot, so it is used only to fill missing values.
+    The imputation flags are retained for audit and downstream ablation tests.
+    """
+
+    root = Path(root)
+    frame = frame.copy()
+    if "team" not in frame:
+        frame["team"] = np.nan
+    if "position" not in frame:
+        frame["position"] = np.nan
+    frame["team"] = frame["team"].astype(object)
+    frame["position"] = frame["position"].astype(object)
+    frame["metadata_team_imputed"] = 0.0
+    frame["metadata_position_imputed"] = 0.0
+    position_map = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
+    for season in frame["season"].astype(str).unique():
+        metadata_path = root / season / "players_raw.csv"
+        if not metadata_path.exists():
+            continue
+        try:
+            metadata = pd.read_csv(metadata_path, encoding="utf-8")
+        except UnicodeDecodeError:
+            metadata = pd.read_csv(metadata_path, encoding="latin-1")
+        if "id" in metadata and "element" not in metadata:
+            metadata["element"] = metadata["id"]
+        needed = [column for column in ("element", "team", "element_type") if column in metadata]
+        if "element" not in needed:
+            continue
+        metadata = metadata[needed].copy()
+        metadata["element"] = pd.to_numeric(metadata["element"], errors="coerce")
+        metadata = metadata.dropna(subset=["element"]).drop_duplicates("element")
+        metadata["metadata_position"] = metadata.get("element_type", pd.Series(index=metadata.index)).map(position_map)
+        season_mask = frame["season"].astype(str) == season
+        lookup = frame.loc[season_mask, ["element", "team", "position"]].copy()
+        lookup["_row_index"] = lookup.index
+        lookup["element"] = pd.to_numeric(lookup["element"], errors="coerce")
+        lookup = lookup.merge(metadata, on="element", how="left", suffixes=("", "_metadata"))
+        team_missing = lookup["team"].isna() & lookup["team_metadata"].notna()
+        position_missing = lookup["position"].isna() & lookup["metadata_position"].notna()
+        if team_missing.any():
+            frame.loc[lookup.loc[team_missing, "_row_index"], "team"] = lookup.loc[team_missing, "team_metadata"].to_numpy()
+            frame.loc[lookup.loc[team_missing, "_row_index"], "metadata_team_imputed"] = 1.0
+        if position_missing.any():
+            frame.loc[lookup.loc[position_missing, "_row_index"], "position"] = lookup.loc[position_missing, "metadata_position"].to_numpy()
+            frame.loc[lookup.loc[position_missing, "_row_index"], "metadata_position_imputed"] = 1.0
+    return frame
 
 
 def _numeric(frame: pd.DataFrame, column: str) -> pd.Series:
@@ -397,6 +451,40 @@ def build_extended_player_feature_table(
     """
 
     frame = build_player_feature_table(raw)
+    for column in ("metadata_team_imputed", "metadata_position_imputed"):
+        if column not in frame:
+            frame[column] = 0.0
+    # Keep a second history keyed only by player.  The season-local features
+    # below are useful for recency, but resetting them at every season means
+    # a GW1 decision cannot use the prior season that was genuinely known at
+    # that deadline.  These career features are still point-in-time safe:
+    # ``_strict_prior`` excludes the current gameweek, including double-GW
+    # fixtures, before any rolling statistic is computed.
+    career_source_features = (
+        "total_points",
+        "xP",
+        "minutes",
+        "starts",
+        "goals_scored",
+        "assists",
+        "expected_goals",
+        "expected_assists",
+        "value",
+        "selected",
+        "transfers_in",
+        "transfers_out",
+        "transfers_balance",
+    )
+    career_features: dict[str, pd.Series] = {}
+    for column in career_source_features:
+        prior = _strict_prior(frame, column)
+        career_features[f"career_{column}_last"] = prior
+        career_features[f"career_{column}_mean_5"] = _rolling_prior(frame, prior, 5)
+        career_features[f"career_{column}_mean_10"] = _rolling_prior(frame, prior, 10)
+        career_features[f"career_{column}_ewma_5"] = _ewma_prior(frame, prior, 5)
+    frame = pd.concat([frame, pd.DataFrame(career_features, index=frame.index)], axis=1)
+    frame["career_games_before"] = frame.groupby("player_key", sort=False).cumcount()
+
     frame["player_season_key"] = frame["player_key"].astype(str) + "|" + frame["season"].astype(str)
     player_group = frame.groupby("player_season_key", sort=False)
     computed_features: dict[str, pd.Series] = {}
@@ -436,12 +524,19 @@ def build_extended_player_feature_table(
     frame["points_ewma_3"] = _ewma_prior(frame, points_prior, 3, group_column="player_season_key")
     frame["points_ewma_10"] = _ewma_prior(frame, points_prior, 10, group_column="player_season_key")
     frame["form_acceleration"] = frame["points_ewma_3"] - frame["points_ewma_10"]
+    frame["points_vs_career"] = frame["points_mean_5"] - frame["career_total_points_mean_5"]
+    frame["minutes_vs_career"] = frame["minutes_mean_5"] - frame["career_minutes_mean_5"]
+    frame["price_vs_career"] = frame["value_mean_5"] - frame["career_value_mean_5"]
     frame["minutes_ewma_10"] = _ewma_prior(frame, minutes_prior, 10, group_column="player_season_key")
     frame["minutes_trend"] = frame["minutes_ewma_5"] - frame["minutes_ewma_10"]
     frame["start_rate_5"] = _rolling_prior(
         frame, _strict_prior(frame, "starts", group_column="player_season_key"), 5, group_column="player_season_key"
     ) / 1.0
     frame["minutes_share_5"] = frame["minutes_mean_5"] / 90.0
+    frame["breakout_signal"] = (
+        frame["points_vs_career"].fillna(0.0)
+        * frame["minutes_share_5"].fillna(0.0)
+    )
     frame["blank_rate_5"] = _rolling_prior(
         frame,
         (points_prior <= 2).astype(float),
@@ -576,6 +671,13 @@ EXTENDED_NUMERIC_FEATURES = list(
             "price_momentum",
             "value_per_point_5",
             "points_per_value_5",
+            "career_games_before",
+            "points_vs_career",
+            "minutes_vs_career",
+            "price_vs_career",
+            "breakout_signal",
+            "metadata_team_imputed",
+            "metadata_position_imputed",
             *[f"{column}_observed" for column in EXTENDED_SOURCE_FEATURES],
             "news_availability_delta",
             "news_role_security_delta",
@@ -592,6 +694,25 @@ EXTENDED_NUMERIC_FEATURES = list(
             f"{column}_{suffix}"
             for column in EXTENDED_SOURCE_FEATURES
             for suffix in ("last", "mean_3", "mean_5", "mean_10", "ewma_5", "std_5")
+        ]
+        + [
+            f"career_{column}_{suffix}"
+            for column in (
+                "total_points",
+                "xP",
+                "minutes",
+                "starts",
+                "goals_scored",
+                "assists",
+                "expected_goals",
+                "expected_assists",
+                "value",
+                "selected",
+                "transfers_in",
+                "transfers_out",
+                "transfers_balance",
+            )
+            for suffix in ("last", "mean_5", "mean_10", "ewma_5")
         ]
         + [
             "team_match_points_mean_5",

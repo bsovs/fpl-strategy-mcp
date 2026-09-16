@@ -158,13 +158,19 @@ PYTHONPATH=src python scripts/train_player_models.py \
 The trainer builds 200+ numeric point-in-time features plus categorical context:
 lagged form and volatility, minutes/start security, ownership and transfer
 momentum, price movement, team/opponent and prior-matchup form, schedule shape,
-and optional timestamped news/social context. It writes the selected player
+cross-season player history and breakout signals, and optional timestamped
+news/social context. It writes the selected player
 forecast model, a future-price model, evaluation predictions, metrics, and a
 data audit under `runs/player-models/`. News/social columns remain zero unless
 an auditable `ContextStore` is supplied; modern articles are never backfilled
 into old seasons. These forecast artifacts are research inputs and are not
 promoted to the shipped action-policy champion until the legal season
 simulator shows a robust strategy-level improvement.
+
+The downloader also fetches one `players_raw.csv` roster snapshot per season.
+This restores the missing position/team fields in the oldest Vaastav GW files;
+the resulting `metadata_*_imputed` flags are retained in the audit because a
+season-level roster snapshot is not a point-in-time transfer history.
 
 To test decision value on the held-out season, bridge the forecast CSV into
 the legal simulator:
@@ -178,9 +184,32 @@ PYTHONPATH=src python scripts/backtest_forecast_strategy.py \
 ```
 
 This compares the legacy signals and expanded forecasts under the same
-rules-aware free-transfer policy. It is a strategy smoke test; the final
-cocktail still needs walk-forward action-value training and held-out starting
-squad families before a 2,413-point claim is defensible.
+rules-aware free-transfer policy. It is a strategy smoke test. For the
+walk-forward action-value layer, run:
+
+```sh
+PYTHONPATH=src python scripts/train_action_policy.py \
+  --history-root data/vaastav \
+  --validation-season 2024-25 \
+  --evaluation-season 2025-26 \
+  --output-dir runs/action-policy \
+  --max-states 4 \
+  --candidate-width 6 \
+  --horizon-gameweeks 3 \
+  --training-chip-depth 5 \
+  --test-chip-depth 15 \
+  --forecast-model neural
+```
+
+This generates legal counterfactual action labels, fits the action ensemble,
+and evaluates neural actions against the free-transfer anchor over points,
+value, template, and randomized opening squads. The current career-feature
+run produced 1,440 development and 176 validation examples; on the untouched
+2025/26 replay its best opening family scored 2,111 points, below the 2,413
+research target. It is therefore a research artifact, not a promoted
+champion. The same run's anchored cocktail averaged 1,931.5 on the untouched
+test, so the current public fallback remains the transparent anchor until the
+gate is tuned on additional held-out seasons.
 
 ## License
 

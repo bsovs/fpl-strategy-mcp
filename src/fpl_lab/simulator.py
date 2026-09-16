@@ -126,7 +126,12 @@ def build_season_data(raw: pd.DataFrame, season: str) -> SeasonData:
         raise ValueError(f"no rows found for season {season}")
     frame["position"] = frame["position"].map(_position)
     frame = frame[frame["position"].isin(POSITIONS)].copy()
-    frame["player_id"] = frame["element"].astype(str)
+    frame["player_id"] = (
+        pd.to_numeric(frame["element"], errors="coerce")
+        .round()
+        .astype("Int64")
+        .astype(str)
+    )
     frame["team"] = frame["team"].astype(str)
     for column in ("value", "total_points", "minutes", "selected", "transfers_in", "transfers_out"):
         if column not in frame:
@@ -714,6 +719,65 @@ def select_initial_squad(
     return [players[index].player_id for index, value in enumerate(result.x) if value > 0.5]
 
 
+def select_initial_squad_from_signals(
+    current: SeasonData,
+    signals: Iterable[PlayerSignal],
+    budget_tenths: int = 1000,
+) -> list[str]:
+    """Select a legal opening squad from point-in-time forecast signals.
+
+    This mode is useful for separating opening-squad quality from transfer
+    policy quality.  Signals must be available before GW1, and the optimizer
+    still enforces the ordinary 15-player quotas, budget, and three-player
+    club cap.  It is intentionally not used by the legacy points/value modes.
+    """
+
+    snapshots = current.snapshots_by_gw.get(1, {})
+    players = list(snapshots.values())
+    signal_by_id = {signal.player_id: signal for signal in signals}
+    if not players:
+        raise ValueError("no GW1 players available")
+    fallback = PlayerSignal("", 0.0, 0.0)
+    scores = np.asarray(
+        [
+            (
+                0.50 * (signal := signal_by_id.get(player.player_id, fallback)).short_expected_points
+                + 0.30 * signal.long_expected_points
+                + 0.20 * signal.next_expected_points
+                + 0.10 * signal.short_price_signal
+            )
+            for player in players
+        ],
+        dtype=float,
+    )
+    n = len(players)
+    rows = [np.ones(n)]
+    lower = [15]
+    upper = [15]
+    for position, quota in SQUAD_QUOTAS.items():
+        rows.append(np.asarray([float(player.position == position) for player in players]))
+        lower.append(quota)
+        upper.append(quota)
+    teams = sorted({player.team for player in players})
+    for team in teams:
+        rows.append(np.asarray([float(player.team == team) for player in players]))
+        lower.append(-np.inf)
+        upper.append(3)
+    rows.append(np.asarray([player.price_tenths for player in players], dtype=float))
+    lower.append(-np.inf)
+    upper.append(budget_tenths)
+    result = milp(
+        c=-scores,
+        integrality=np.ones(n),
+        bounds=Bounds(np.zeros(n), np.ones(n)),
+        constraints=LinearConstraint(np.vstack(rows), np.asarray(lower), np.asarray(upper)),
+        options={"time_limit": 30},
+    )
+    if not result.success or result.x is None:
+        raise ValueError(f"forecast initial squad optimization failed: {result.message}")
+    return [players[index].player_id for index, value in enumerate(result.x) if value > 0.5]
+
+
 def validate_initial_squad(
     current: SeasonData,
     squad_ids: Iterable[str],
@@ -1036,6 +1100,7 @@ def build_neural_action_candidates(
     signals: list[PlayerSignal],
     candidate_width: int = 12,
     chips_available: Iterable[str] | None = None,
+    chip_transfer_depth: int = 15,
 ) -> list[PolicyActionCandidate]:
     """Build legal transfer, hold, and chip actions for the neural policy."""
 
@@ -1073,6 +1138,7 @@ def build_neural_action_candidates(
         bank_tenths,
         signals,
         recommendations.values(),
+        max_depth=chip_transfer_depth,
     ) if available_chips.intersection({"wildcard", "free_hit"}) else ()
     for chip in CHIP_KINDS:
         if chip not in available_chips:
@@ -1134,6 +1200,7 @@ def _choose_neural_action(
     signals: list[PlayerSignal],
     neural_policy: ActionValueMLP | ActionValueEnsemble,
     chips_available: Iterable[str] | None = None,
+    chip_transfer_depth: int = 15,
 ) -> PolicyActionCandidate | None:
     candidates = build_neural_action_candidates(
         current,
@@ -1144,6 +1211,7 @@ def _choose_neural_action(
         free_transfers,
         signals,
         chips_available=chips_available,
+        chip_transfer_depth=chip_transfer_depth,
     )
     state = policy_state_from_runtime(
         current,
@@ -1204,6 +1272,7 @@ def _choose_cocktail_action(
     neural_policy: ActionValueMLP | ActionValueEnsemble | None,
     cocktail_config: CocktailConfig | None = None,
     chips_available: Iterable[str] | None = None,
+    chip_transfer_depth: int = 15,
 ) -> PolicyActionCandidate | None:
     """Choose an anchored, gated model action.
 
@@ -1259,6 +1328,7 @@ def _choose_cocktail_action(
         signals,
         candidate_width=12,
         chips_available=available_chips,
+        chip_transfer_depth=chip_transfer_depth,
     )
     if not candidates:
         return anchor_candidate
@@ -1355,6 +1425,7 @@ def simulate_season(
     transfer_beam_width: int = 12,
     transfer_candidate_width: int = 18,
     cocktail_config: CocktailConfig | None = None,
+    chip_transfer_depth: int = 15,
 ) -> PolicySeasonResult:
     """Simulate a season or counterfactual from a legal pre-deadline state.
 
@@ -1377,13 +1448,22 @@ def simulate_season(
     if initial_squad_ids is None:
         if start_gameweek != 1:
             raise ValueError("an explicit initial_squad_ids state is required after GW1")
-        squad_ids = select_initial_squad(
-            current,
-            previous,
-            rules.budget_tenths,
-            mode=initial_squad_mode,
-            seed=initial_squad_seed,
-        )
+        if initial_squad_mode == "forecast":
+            if signal_cache is None or 1 not in signal_cache:
+                raise ValueError("initial_squad_mode='forecast' requires GW1 signal_cache")
+            squad_ids = select_initial_squad_from_signals(
+                current,
+                signal_cache[1],
+                rules.budget_tenths,
+            )
+        else:
+            squad_ids = select_initial_squad(
+                current,
+                previous,
+                rules.budget_tenths,
+                mode=initial_squad_mode,
+                seed=initial_squad_seed,
+            )
     else:
         squad_ids = list(initial_squad_ids)
         if start_gameweek == 1:
@@ -1466,6 +1546,7 @@ def simulate_season(
                     signals,
                     neural_policy,
                     chips_available=chips_available,
+                    chip_transfer_depth=chip_transfer_depth,
                 )
                 if neural_action is not None:
                     transfer_bundle = list(neural_action.transfer_bundle)
@@ -1482,6 +1563,7 @@ def simulate_season(
                     neural_policy,
                     cocktail_config=cocktail_config,
                     chips_available=chips_available,
+                    chip_transfer_depth=chip_transfer_depth,
                 )
                 if cocktail_action is not None:
                     transfer_bundle = list(cocktail_action.transfer_bundle)
