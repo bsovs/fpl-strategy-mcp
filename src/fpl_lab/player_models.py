@@ -417,14 +417,21 @@ def _add_context_features(frame: pd.DataFrame, context_store: object | None) -> 
             frame[column] = 0.0
         return
     rows: list[dict[str, float]] = []
+    # Fixture-grain history repeats the same player/deadline context on every
+    # fixture in a double gameweek.  Cache those immutable aggregates so a
+    # large archived role/news stream does not make feature construction
+    # quadratic in the number of fixture rows.
+    feature_cache: dict[tuple[str, str, str, str], object] = {}
     for _, row in frame.iterrows():
         player_id = str(int(row["element"])) if float(row.get("element", 0.0)) > 0 else ""
-        features = context_store.features_for_player(
-            player_id,
-            str(row["name"]),
-            str(row["team"]),
-            row.get("decision_time", row["kickoff_time"]),
-        )
+        player_name = str(row["name"])
+        team = str(row["team"])
+        as_of = row.get("decision_time", row["kickoff_time"])
+        cache_key = (player_id, player_name, team, str(as_of))
+        features = feature_cache.get(cache_key)
+        if features is None:
+            features = context_store.features_for_player(player_id, player_name, team, as_of)
+            feature_cache[cache_key] = features
         rows.append(
             {
                 "news_availability_delta": features.availability_delta,

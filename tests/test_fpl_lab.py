@@ -13,6 +13,7 @@ from fpl_lab.model import PoissonTeamGoalsModel
 from fpl_lab.player_models import build_extended_player_feature_table, build_player_feature_table
 from fpl_lab.policy import ActionValueEnsemble, ActionValueMLP, PolicyAction, PolicyState, encode_state_action
 from fpl_lab.simulator import build_model_signal_cache, build_season_data, season_rules, selling_price_tenths
+from fpl_strategy_mcp.server import _official_signal_rows
 
 
 def synthetic_matches() -> list[Match]:
@@ -345,6 +346,68 @@ class FplLabTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].event_type, "transfer")
         self.assertEqual(events[0].observed_at.isoformat(), "2026-09-01T12:00:00+00:00")
+
+    def test_bootstrap_news_extracts_official_set_piece_role(self):
+        events = bootstrap_news_events(
+            {
+                "elements": [
+                    {
+                        "id": 7,
+                        "web_name": "Player",
+                        "team": 1,
+                        "status": "a",
+                        "chance_of_playing_next_round": 100,
+                        "news": "",
+                        "penalties_order": 1,
+                        "penalties_text": "Penalties",
+                        "direct_freekicks_order": None,
+                        "direct_freekicks_text": "",
+                        "corners_and_indirect_freekicks_order": None,
+                        "corners_and_indirect_freekicks_text": "",
+                    }
+                ]
+            },
+            fetched_at="2026-09-01T12:00:00Z",
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].event_type, "set_piece")
+        self.assertEqual(events[0].sentiment, 1.0)
+        self.assertIsNone(events[0].expires_at)
+
+    def test_official_signal_fallback_uses_current_api_roles_and_risks(self):
+        rows = [{"player_id": "7"}]
+        elements = {
+            "7": {
+                "id": 7,
+                "ep_next": "5.0",
+                "ep_this": "5.0",
+                "form": "5.0",
+                "points_per_game": "5.0",
+                "chance_of_playing_next_round": 75,
+                "status": "d",
+                "selected_by_percent": "10.0",
+                "transfers_in_event": 1000,
+                "transfers_out_event": 500,
+                "value_season": "5.0",
+                "news": "Doubtful after a knock",
+                "scout_risks": ["Rotation risk"],
+                "penalties_order": 1,
+                "penalties_text": "Penalties",
+                "direct_freekicks_order": None,
+                "direct_freekicks_text": "",
+                "corners_and_indirect_freekicks_order": None,
+                "corners_and_indirect_freekicks_text": "",
+                "price_change_percent": "1.2",
+                "price_change_projections": [{"offset": 0, "projected_percent": "1.8"}, {"offset": 2, "projected_percent": "4.0"}],
+                "cost_change_start": 2,
+            }
+        }
+        signal = _official_signal_rows(rows, elements, gameweek=10)[0]
+        self.assertGreater(signal.injury_risk, 0.0)
+        self.assertGreater(signal.rotation_risk, 0.0)
+        self.assertEqual(signal.set_piece_signal, 1.0)
+        self.assertLess(signal.news_sentiment, 0.0)
+        self.assertEqual(signal.short_price_signal, 0.36)
 
     def test_historical_context_uses_gameweek_deadline_not_kickoff(self):
         raw = pd.DataFrame(

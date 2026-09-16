@@ -221,13 +221,26 @@ the anchor in this replay, but the best result is still 257 points below the
 champion.
 
 The context files are optional. Each event must carry a publication timestamp;
-the feature builder cuts it off at the simulated gameweek deadline (90 minutes
-before the first fixture), not at kickoff. Supported structured event types
+archived events also carry the snapshot `observed_at` timestamp. The live
+official API exposes current cumulative `minutes`/`starts`, current
+`chance_of_playing_this_round`/`chance_of_playing_next_round`, `news`,
+`scout_risks`, price projections, and set-piece order fields. Its player
+history exposes realized minutes and starts, not historical probability
+snapshots; use `scripts/fetch_fplcache_context.py` to reconstruct those
+point-in-time beliefs. The feature builder cuts context off at the simulated
+gameweek deadline (90 minutes before the first fixture), not at kickoff.
+Supported structured event types
 include `injury`, `availability`, `suspension`, `rotation`,
 `lineup_predicted`, `lineup_confirmed`, `lineup_benched`, `set_piece`, and
 `transfer`. Store the analyzed sentiment, source, reliability, player/team
 entity, and expiry alongside the text so the backtest can audit what was known.
 See `docs/context-data-contract.md`.
+
+The validated official archive replay sampled 1,722 snapshots through 1 August
+2026, produced 9,366 interval/news events, improved validation action RMSE from
+9.016 to 8.670, but reduced the held-out 2025/26 neural policy to 2,007.5 mean
+points. It is therefore an inspectable context ablation, not part of the
+shipped champion until the action layer gates and calibrates these signals.
 
 For a model-family ablation, add `--forecast-model ridge`. The expanded ridge
 run reached 2,189 points in an earlier replay, but that result used the
@@ -248,17 +261,17 @@ scores, opponents, and fixture timing. The model turns this into 286
 point-in-time features and keeps the 2025/26 season completely out of fitting
 and model selection.
 
-The important gaps are contextual rather than raw player rows. The historical
-archive does not provide a complete timestamped expected-minutes history,
-confirmed team-news/social stream, richer historical fixture-strength feed, or
-real rival-manager actions. The pipeline now has a leakage-safe expected-
-minutes ablation, but it is not yet a validated strategy improvement. The
-oldest gameweek files also need season-level
-roster snapshots to fill team/position metadata; those rows are flagged and
-are not treated as point-in-time transfer history. Consequently, news/social
-signals are available in the input contract and live ingestion path, but are
-zero/absent in this historical replay unless a timestamped context archive is
-supplied.
+The important gaps are contextual rather than raw player rows. The public
+snapshot archive now supplies official news/availability and set-piece
+intervals, but it does not provide a complete timestamped expected-minutes
+history, press-conference/predicted-lineup/social stream, richer historical
+fixture-strength feed, or real rival-manager actions. The pipeline has a
+leakage-safe expected-minutes model and a full official-context ablation, but
+neither is currently a validated strategy improvement. The oldest gameweek
+files also need season-level roster snapshots to fill team/position metadata;
+those rows are flagged and are not treated as point-in-time transfer history.
+News/social signals require an explicitly supplied timestamped context archive
+in the historical trainer.
 
 The temporal audit found and fixed 293 three-gameweek label mismatches caused
 by skipping blank calendar gameweeks, plus inconsistent lag values in 416

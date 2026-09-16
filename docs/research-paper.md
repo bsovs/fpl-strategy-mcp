@@ -250,6 +250,14 @@ replace a complete historical expected-minutes, press-conference, lineup, or
 social model. See `docs/context-data-contract.md` for the event schema and
 ingestion rules.
 
+The first full archive replay used 1,722 snapshots and 9,366 normalized
+official events through the 2025/26 holdout. It improved validation action RMSE
+from 9.016 to 8.670, but reduced held-out neural points from 2,076.25 to
+2,007.50 on the four opening families. This prevents us from treating
+official context as automatically beneficial: the current action layer appears
+to overreact to some availability/role changes, so the context path remains an
+ablation until selectively gated and recalibrated.
+
 Price is treated as an input and a future-state concern. The current
 walk-forward price-change model is wired into the action bridge and evaluated
 with the same cutoff as the points model. Its distribution is intended to feed

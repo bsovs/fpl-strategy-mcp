@@ -21,12 +21,14 @@ a player who appeared later in the season.
   "event_type": "lineup_confirmed",
   "sentiment": 0.9,
   "reliability": 1.0,
-  "expires_at": "2025-08-15T12:00:00Z"
+  "expires_at": "2025-08-15T12:00:00Z",
+  "observed_at": "2025-08-14T09:16:00Z"
 }
 ```
 
-`published_at`, `source`, and either a player or team entity are the important
-audit fields. `sentiment` can be supplied by an external classifier or analyst;
+`published_at`, `observed_at`, `source`, and either a player or team entity are
+the important audit fields. `sentiment` can be supplied by an external
+classifier or analyst;
 if omitted, the local deterministic lexicon provides a conservative fallback.
 The raw text should still be retained so a later sentiment model can be
 retrained and audited without changing event timing.
@@ -62,6 +64,22 @@ may explain the outcome but cannot be used to choose the squad. The test suite
 contains a regression test for an injury published between the deadline and
 kickoff.
 
+## What the official API does and does not provide
+
+The live `bootstrap-static` endpoint exposes current cumulative player
+`minutes` and `starts`, current `chance_of_playing_this_round` and
+`chance_of_playing_next_round`, `news`/`news_added`, `scout_risks`, current
+price projections, and current penalty/direct-free-kick/corner order fields.
+The per-player `element-summary/{id}/` endpoint exposes realized historical
+gameweek `minutes` and `starts` (and historical performance metrics), but not
+the historical values of the old `chance_of_playing_*` estimates. Therefore:
+
+- realized minutes/starts train the expected-minutes model;
+- archived bootstrap snapshots reconstruct what the availability estimate and
+  official news said at each historical point; and
+- press-conference, predicted-lineup, and social probabilities require
+  separate timestamped sources.
+
 ## Ingestion
 
 Normalize provider exports with:
@@ -85,9 +103,8 @@ PYTHONPATH=src python scripts/train_action_policy.py \
 ```
 
 The current public historical archive does not contain a complete backdated
-news/social feed. Until one is supplied, those columns remain zero in the
-walk-forward benchmark. Current bootstrap news is suitable for live decisions,
-but must not be backfilled into historical seasons.
+press-conference/social feed. Current bootstrap news is suitable for live
+decisions, but must not be backfilled into historical seasons.
 
 ## Official snapshot archive
 
@@ -100,14 +117,19 @@ time as `observed_at`:
 ```sh
 PYTHONPATH=src python scripts/fetch_fplcache_context.py \
   --start-date 2021-04-01 \
-  --end-date 2025-08-01 \
-  --sample-hours 6 \
+  --end-date 2026-08-01 \
+  --sample-hours 24 \
   --out data/context/fplcache-news.jsonl \
   --manifest-out data/context/fplcache-manifest.json
 ```
 
 Use `--dry-run` first and keep the manifest with the generated JSONL. The
-archive is valuable for historical availability and official-news replay, but
-it does not provide every press-conference, predicted-lineup, or social signal.
-Those sources need separate timestamped feeds and should be joined under the
-same deadline and `observed_at` rules.
+validated run selected 1,722 snapshots, had zero download failures, and
+produced 9,366 official interval/news events through the 2025/26 holdout. The
+adapter retains one interval per unchanged set-piece role and closes it when
+the official role changes or disappears; ordinary repeated news retains the
+earliest snapshot that exposed it. The archive is valuable for historical
+availability and official-news replay, but it does not provide every
+press-conference, predicted-lineup, or social signal. Those sources need
+separate timestamped feeds and should be joined under the same deadline and
+`observed_at` rules.

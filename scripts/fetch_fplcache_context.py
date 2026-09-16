@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import date, datetime, timedelta, timezone
+from dataclasses import replace
 import json
 import lzma
 from pathlib import Path
@@ -129,17 +130,57 @@ def main() -> None:
         return
 
     events_by_id = {}
+    active_roles: dict[str, tuple[str, str]] = {}
     failures: list[dict[str, str]] = []
     for index, (path, snapshot_time) in enumerate(selected, start=1):
         try:
             payload = json.loads(lzma.decompress(_get_bytes(f"{RAW_ROOT}/{path}")).decode("utf-8"))
-            for event in bootstrap_news_events(payload, fetched_at=snapshot_time):
-                events_by_id[event.event_id] = event
+            snapshot_events = bootstrap_news_events(payload, fetched_at=snapshot_time)
+            current_roles: dict[str, str] = {}
+            for event in snapshot_events:
+                if event.event_type == "set_piece":
+                    role_key = str(event.player_id or event.player_name or "")
+                    current_roles[role_key] = event.body
+                    active = active_roles.get(role_key)
+                    if active is not None and active[1] == event.body:
+                        # The same official role is still active; keep one
+                        # interval instead of one event per API snapshot.
+                        continue
+                    if active is not None:
+                        previous = events_by_id.get(active[0])
+                        if previous is not None:
+                            events_by_id[active[0]] = replace(previous, expires_at=event.published_at)
+                    events_by_id[event.event_id] = event
+                    active_roles[role_key] = (event.event_id, event.body)
+                    continue
+                previous = events_by_id.get(event.event_id)
+                if previous is None:
+                    events_by_id[event.event_id] = event
+                elif previous.observed_at is None or (
+                    event.observed_at is not None and event.observed_at < previous.observed_at
+                ):
+                    # A news_added timestamp identifies the same provider
+                    # event across snapshots.  Preserve the first snapshot
+                    # that exposed it; keeping the last one would create
+                    # artificial look-ahead in earlier gameweeks.
+                    events_by_id[event.event_id] = event
+            for role_key in list(active_roles):
+                if role_key in current_roles:
+                    continue
+                event_id, _ = active_roles.pop(role_key)
+                previous = events_by_id.get(event_id)
+                if previous is not None:
+                    events_by_id[event_id] = replace(previous, expires_at=snapshot_time)
         except Exception as exc:  # noqa: BLE001 - preserve partial archive progress
             failures.append({"path": path, "error": str(exc)})
         if index % 25 == 0 or index == len(selected):
             print(f"Processed {index:,}/{len(selected):,} snapshots; {len(events_by_id):,} unique events", flush=True)
 
+    archive_end = selected[-1][1] + timedelta(hours=36) if selected else datetime.now(UTC)
+    for event_id, _ in active_roles.values():
+        previous = events_by_id.get(event_id)
+        if previous is not None and previous.expires_at is None:
+            events_by_id[event_id] = replace(previous, expires_at=archive_end)
     store = ContextStore(events_by_id.values())
     output = Path(args.out)
     store.write_jsonl(output)
@@ -152,6 +193,8 @@ def main() -> None:
         "selected_snapshots": len(selected),
         "download_failures": failures,
         "context": store.summary(),
+        "dedupe_rule": "retain earliest observed_at for repeated event_id",
+        "set_piece_rule": "retain one interval per player role state and close it when the official role changes or disappears",
         "observed_at_rule": "official bootstrap events are eligible only at or after the cache snapshot that contained them",
     }
     manifest_path = Path(args.manifest_out)

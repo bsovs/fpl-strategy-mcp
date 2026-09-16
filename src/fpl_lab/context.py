@@ -266,14 +266,34 @@ class ContextStore:
             return ContextFeatures()
         player_key = normalize_text(player_name)
         team_key = normalize_text(team)
-        candidate_events = {
-            *self._by_player_id.get(str(player_id), []),
-            *self._by_player_name.get(player_key, []),
-            *self._by_team.get(team_key, []),
-            *self._team_level,
-        }
+        direct_events = self._by_player_id.get(str(player_id), [])
+        name_events = [
+            event
+            for event in self._by_player_name.get(player_key, [])
+            if not event.player_id or str(event.player_id) == str(player_id)
+        ]
+        team_events = [
+            event
+            for event in self._by_team.get(team_key, [])
+            if not event.player_id and not event.player_name
+        ]
+        sources = [events for events in (direct_events, name_events, team_events) if events]
+        if len(sources) == 1:
+            # Each index is appended in published/event-id order during
+            # initialization, so the common direct-player path needs no
+            # repeated sort or hashing of the full dataclass.
+            candidate_events = sources[0]
+        else:
+            # Use the stable event ID for cross-index deduplication.  Hashing
+            # the complete frozen event was disproportionately expensive for
+            # large archived bootstrap role streams.
+            by_event_id: dict[str, ContextEvent] = {}
+            for source_events in sources:
+                for event in source_events:
+                    by_event_id[event.event_id] = event
+            candidate_events = sorted(by_event_id.values(), key=lambda item: (item.published_at, item.event_id))
         matched: list[tuple[ContextEvent, float]] = []
-        for event in sorted(candidate_events, key=lambda item: (item.published_at, item.event_id)):
+        for event in candidate_events:
             if event.published_at > cutoff:
                 continue
             if event.observed_at is not None and event.observed_at > cutoff:
@@ -413,8 +433,11 @@ def _event_from_record(record: dict[str, Any], kind: str, index: int) -> Context
         0.0,
         1.0,
     )
-    expiry = parse_timestamp(record.get("expires_at"))
-    if expiry is None:
+    if "expires_at" in record:
+        # An explicit JSON null means an open-ended interval.  Missing expiry
+        # keeps the conservative default TTL for ordinary news records.
+        expiry = parse_timestamp(record.get("expires_at"))
+    else:
         ttl_hours = 72 if event_type in {"injury", "suspension", "availability"} else 48
         expiry = published + timedelta(hours=ttl_hours)
     event_id = str(record.get("event_id") or record.get("id") or "").strip()
@@ -496,38 +519,108 @@ def bootstrap_news_events(bootstrap: dict[str, Any], fetched_at: datetime | None
         status = str(player.get("status") or "").strip().lower()
         chance = player.get("chance_of_playing_next_round")
         chance_value = _float(chance, 100.0) if chance is not None else 100.0
-        if not news and status in {"a", "i"} and chance_value >= 100:
-            continue
-        if not news:
-            news = f"Official FPL status: {status or 'unknown'}; chance next round {chance_value:.0f}%"
-        published = parse_timestamp(player.get("news_added")) or now
-        inferred_type = _infer_event_type(news)
-        if inferred_type in {"transfer", "set_piece", "lineup_confirmed", "lineup_predicted", "lineup_benched"}:
-            event_type = inferred_type
-        else:
-            event_type = "availability" if chance_value < 75 or status in {"i", "s", "u"} else "general"
-            if chance_value < 25:
-                event_type = "injury"
-        sentiment = _clip((chance_value - 50.0) / 50.0, -1.0, 1.0)
-        events.append(
-            _event_from_record(
-                {
-                    "event_id": f"fpl-bootstrap-{player.get('id')}-{published.isoformat()}",
-                    "published_at": published.isoformat(),
-                    "source": "official FPL",
-                    "title": news,
-                    "body": news,
-                    "player_id": player.get("id"),
-                    "player_name": player.get("web_name") or f"{player.get('first_name', '')} {player.get('second_name', '')}".strip(),
-                    "team": player.get("team"),
-                    "event_type": event_type,
-                    "sentiment": sentiment,
-                    "reliability": 1.0,
-                    "expires_at": (published + timedelta(hours=36)).isoformat(),
-                    "observed_at": now.isoformat(),
-                },
-                kind="news",
-                index=int(player.get("id", 0)),
+        has_set_piece_role = any(
+            player.get(order_key) is not None or bool(str(player.get(text_key) or "").strip())
+            for order_key, text_key in (
+                ("penalties_order", "penalties_text"),
+                ("direct_freekicks_order", "direct_freekicks_text"),
+                ("corners_and_indirect_freekicks_order", "corners_and_indirect_freekicks_text"),
             )
         )
+        if not news and status in {"a", "i"} and chance_value >= 100 and not has_set_piece_role:
+            continue
+        if not news and not (has_set_piece_role and status in {"a", "i"} and chance_value >= 100):
+            news = f"Official FPL status: {status or 'unknown'}; chance next round {chance_value:.0f}%"
+        if news:
+            published = parse_timestamp(player.get("news_added")) or now
+            inferred_type = _infer_event_type(news)
+            if inferred_type in {"transfer", "set_piece", "lineup_confirmed", "lineup_predicted", "lineup_benched"}:
+                event_type = inferred_type
+            elif inferred_type != "general":
+                event_type = inferred_type
+            elif news.lower().startswith("official fpl status:"):
+                event_type = "availability" if chance_value < 75 or status in {"i", "s", "u"} else "general"
+                if chance_value < 25:
+                    event_type = "injury"
+            else:
+                # Preserve the provider's unclassified news as general
+                # context.  A player status of ``i`` is not enough to turn a
+                # contract, transfer, or administrative note into an injury.
+                event_type = "general"
+            sentiment = _clip((chance_value - 50.0) / 50.0, -1.0, 1.0)
+            events.append(
+                _event_from_record(
+                    {
+                        "event_id": f"fpl-bootstrap-{player.get('id')}-{published.isoformat()}",
+                        "published_at": published.isoformat(),
+                        "source": "official FPL",
+                        "title": news,
+                        "body": news,
+                        "player_id": player.get("id"),
+                        "player_name": player.get("web_name") or f"{player.get('first_name', '')} {player.get('second_name', '')}".strip(),
+                        "team": player.get("team"),
+                        "event_type": event_type,
+                        "sentiment": sentiment,
+                        "reliability": 1.0,
+                        "expires_at": (published + timedelta(hours=36)).isoformat(),
+                        "observed_at": now.isoformat(),
+                    },
+                    kind="news",
+                    index=int(player.get("id", 0)),
+                )
+            )
+        # Current and archived bootstrap payloads also expose official
+        # set-piece order fields.  They are not historical injury
+        # probabilities, but they are valuable point-in-time role evidence.
+        # Emit them at the snapshot observation time because the API does not
+        # provide a separate publication timestamp for these fields.
+        set_piece_roles: list[str] = []
+        set_piece_orders: list[int] = []
+        for label, order_key, text_key in (
+            ("penalties", "penalties_order", "penalties_text"),
+            ("direct free-kicks", "direct_freekicks_order", "direct_freekicks_text"),
+            ("corners", "corners_and_indirect_freekicks_order", "corners_and_indirect_freekicks_text"),
+        ):
+            order = player.get(order_key)
+            text = str(player.get(text_key) or "").strip()
+            if order is None and not text:
+                continue
+            try:
+                order_number = int(order)
+            except (TypeError, ValueError):
+                order_number = 0
+            if order_number > 0:
+                set_piece_orders.append(order_number)
+                set_piece_roles.append(f"{label} order {order_number}")
+            elif text:
+                set_piece_roles.append(f"{label}: {text}")
+        if set_piece_roles:
+            best_order = min(set_piece_orders) if set_piece_orders else 1
+            role_sentiment = 1.0 if best_order == 1 else 0.65 if best_order == 2 else 0.35
+            role_text = "; ".join(set_piece_roles)
+            role_digest = hashlib.sha1(role_text.encode("utf-8")).hexdigest()[:12]
+            events.append(
+                _event_from_record(
+                    {
+                        "event_id": f"fpl-bootstrap-set-piece-{player.get('id')}-{role_digest}-{now.isoformat()}",
+                        "published_at": now.isoformat(),
+                        "observed_at": now.isoformat(),
+                        "source": "official FPL",
+                        "title": f"Official FPL set-piece role: {role_text}",
+                        "body": role_text,
+                        "player_id": player.get("id"),
+                        "player_name": player.get("web_name") or f"{player.get('first_name', '')} {player.get('second_name', '')}".strip(),
+                        "team": player.get("team"),
+                        "event_type": "set_piece",
+                        "sentiment": role_sentiment,
+                        "reliability": 1.0,
+                        # The archive adapter closes this interval when the
+                        # official role changes or disappears.  A live caller
+                        # can still use the event without an expiry.
+                        "expires_at": None,
+                    },
+                    kind="news",
+                    index=int(player.get("id", 0)) + 1_000_000,
+                )
+            )
     return events

@@ -510,6 +510,8 @@ def _official_signal_rows(
         short_points = ep_next or ep_this or form or points_per_game
         long_points = max(points_per_game, short_points) * long_window
         chance = element.get("chance_of_playing_next_round")
+        if chance is None:
+            chance = element.get("chance_of_playing_this_round")
         status = str(element.get("status", "a"))
         if chance is None:
             minutes_probability = {"a": 1.0, "d": 0.5}.get(status, 0.0)
@@ -521,7 +523,58 @@ def _official_signal_rows(
         price_flow = _clip(net_transfers / 150_000.0, -1.0, 1.0)
         value_season = _number(element.get("value_season"))
         news = str(element.get("news", "") or "")
-        risk = 1.0 - minutes_probability
+        scout_risks = element.get("scout_risks") or []
+        if not isinstance(scout_risks, list):
+            scout_risks = [scout_risks]
+        scout_text = "; ".join(str(value) for value in scout_risks if str(value).strip())
+        scout_lower = scout_text.lower()
+        scout_risk = _clip(
+            0.20 * len(scout_risks)
+            + (0.20 if any(word in scout_lower for word in ("injur", "doubt", "suspend")) else 0.0)
+            + (0.10 if "rotation" in scout_lower else 0.0),
+            0.0,
+            0.75,
+        )
+        risk = _clip(1.0 - minutes_probability + scout_risk, 0.0, 1.0)
+        positive_news = sum(news.lower().count(word) for word in ("fit", "available", "starts", "starting", "return", "back"))
+        negative_news = sum(news.lower().count(word) for word in ("injury", "injured", "doubt", "doubtful", "knock", "out", "suspend", "ban", "rotation", "benched", "miss"))
+        news_sentiment = _clip((positive_news - negative_news) / 3.0, -1.0, 1.0)
+        set_piece_roles: list[str] = []
+        set_piece_orders: list[int] = []
+        for label, order_key, text_key in (
+            ("penalties", "penalties_order", "penalties_text"),
+            ("direct free-kicks", "direct_freekicks_order", "direct_freekicks_text"),
+            ("corners", "corners_and_indirect_freekicks_order", "corners_and_indirect_freekicks_text"),
+        ):
+            order = element.get(order_key)
+            text = str(element.get(text_key) or "").strip()
+            if order is None and not text:
+                continue
+            try:
+                order_number = int(order)
+            except (TypeError, ValueError):
+                order_number = 0
+            if order_number > 0:
+                set_piece_orders.append(order_number)
+                set_piece_roles.append(f"{label} order {order_number}")
+            elif text:
+                set_piece_roles.append(f"{label}: {text}")
+        best_set_piece_order = min(set_piece_orders) if set_piece_orders else 0
+        set_piece_signal = (
+            1.0 if best_set_piece_order == 1 else
+            0.65 if best_set_piece_order == 2 else
+            0.35 if best_set_piece_order > 2 else
+            0.0
+        )
+        projections = element.get("price_change_projections") or []
+        projection_by_offset = {
+            int(item.get("offset")): _number(item.get("projected_percent"))
+            for item in projections
+            if isinstance(item, dict) and item.get("offset") is not None
+        }
+        short_price_signal = _clip(projection_by_offset.get(0, _number(element.get("price_change_percent"))) / 5.0, -1.0, 1.0)
+        long_price_signal = _clip(projection_by_offset.get(2, _number(element.get("cost_change_start"))) / 5.0, -1.0, 1.0)
+        trigger_parts = [part for part in (news, scout_text, "; ".join(set_piece_roles)) if part]
         signals.append(
             PlayerSignal(
                 player_id=player_id,
@@ -534,17 +587,19 @@ def _official_signal_rows(
                 value_signal=_clip((value_season - 4.0) / 4.0, -1.0, 1.0),
                 role_security=minutes_probability,
                 injury_risk=risk,
-                rotation_risk=_clip(0.25 * risk, 0.0, 1.0),
+                rotation_risk=_clip(0.25 * risk + (0.15 if "rotation" in scout_lower else 0.0), 0.0, 1.0),
                 price_change_risk=_clip(0.5 * risk, 0.0, 1.0),
                 captain_upside=_clip(short_points / 10.0, 0.0, 1.0),
-                short_price_signal=price_flow,
-                long_price_signal=_clip(_number(element.get("cost_change_start")) / 5.0, -1.0, 1.0),
+                short_price_signal=short_price_signal if projections else price_flow,
+                long_price_signal=long_price_signal,
                 ownership_leverage=ownership_leverage,
-                news_risk=risk if status != "a" or news else 0.0,
-                news_sentiment=0.0,
-                context_event_count=1 if news else 0,
-                trigger=news or f"official status: {status}",
-                note="official bootstrap fallback; replace with the full point-in-time signal ensemble when available",
+                news_risk=risk if status != "a" or news or scout_risks else 0.0,
+                news_sentiment=news_sentiment,
+                set_piece_signal=set_piece_signal,
+                context_reliability=1.0 if news or scout_risks or set_piece_roles else 0.0,
+                context_event_count=int(bool(news)) + len(scout_risks) + len(set_piece_roles),
+                trigger=" | ".join(trigger_parts) or f"official status: {status}",
+                note="official bootstrap fields: chance/news/scout-risk/set-piece/price projections; replace with the full point-in-time signal ensemble when available",
             )
         )
     return signals
@@ -857,6 +912,18 @@ def _search_players(arguments: dict[str, Any]) -> dict[str, Any]:
                 "points_per_game": _number(element.get("points_per_game")),
                 "selected_by_percent": _number(element.get("selected_by_percent")),
                 "chance_of_playing_next_round": element.get("chance_of_playing_next_round"),
+                "chance_of_playing_this_round": element.get("chance_of_playing_this_round"),
+                "news_added": element.get("news_added"),
+                "minutes": _number(element.get("minutes")),
+                "starts": _number(element.get("starts")),
+                "scout_risks": list(element.get("scout_risks") or []),
+                "penalties_order": element.get("penalties_order"),
+                "penalties_text": str(element.get("penalties_text") or ""),
+                "direct_freekicks_order": element.get("direct_freekicks_order"),
+                "direct_freekicks_text": str(element.get("direct_freekicks_text") or ""),
+                "corners_and_indirect_freekicks_order": element.get("corners_and_indirect_freekicks_order"),
+                "corners_and_indirect_freekicks_text": str(element.get("corners_and_indirect_freekicks_text") or ""),
+                "price_change_projections": element.get("price_change_projections") or [],
                 "total_points": _number(element.get("total_points")),
                 "value_season": _number(element.get("value_season")),
                 "transfers_in_event": _number(element.get("transfers_in_event")),
