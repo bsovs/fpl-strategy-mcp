@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "fpl-strategy": {
+      "command": "/ABSOLUTE/PATH/TO/fpl-strategy-mcp"
+    }
+  }
+}
+

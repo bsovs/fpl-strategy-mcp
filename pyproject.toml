@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fpl-strategy-mcp"
+version = "0.1.0"
+description = "A rules-aware Fantasy Premier League action-policy MCP server"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Brandon Sovran" }]
+dependencies = [
+  "joblib>=1.2",
+  "numpy>=1.23",
+  "pandas>=2.0,<3",
+  "scikit-learn>=1.2,<2",
+  "scipy>=1.10,<2",
+]
+
+[project.optional-dependencies]
+remote = ["mcp>=2.0,<3"]
+dev = ["build>=1.2", "pytest>=8", "pyinstaller>=6"]
+
+[project.scripts]
+fpl-strategy-mcp = "fpl_strategy_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+fpl_strategy_mcp = ["assets/*.json", "assets/*.joblib"]
+

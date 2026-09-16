@@ -1,0 +1,7 @@
+{
+  "candidate": "baseline_free",
+  "policy": "points_only_free_only",
+  "config": null,
+  "selection_reason": "No learned cocktail had a positive paired 95% lower confidence bound versus the free-transfer anchor on temporal development folds.",
+  "model_path": "assets/action-policy-model.joblib"
+}

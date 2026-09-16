@@ -1,0 +1,323 @@
+{
+  "protocol": {
+    "development_seasons": [
+      "2021-22",
+      "2022-23",
+      "2023-24"
+    ],
+    "holdout_season": "2024-25",
+    "validation_folds": [
+      {
+        "validation_season": "2022-23",
+        "training_seasons": [
+          "2021-22"
+        ],
+        "training_examples": 1131
+      },
+      {
+        "validation_season": "2023-24",
+        "training_seasons": [
+          "2021-22",
+          "2022-23"
+        ],
+        "training_examples": 2276
+      }
+    ],
+    "starting_squads_per_development_season": [
+      "points_optimal",
+      "value_balanced",
+      "template_proxy"
+    ],
+    "holdout_starting_squads": [
+      "holdout_random_101",
+      "holdout_random_202"
+    ],
+    "counterfactual_examples_source": "not included in the binary distribution; generated in the research workspace",
+    "chip_opportunity_cost": 0.65,
+    "selection_rule": "maximize paired 95% lower confidence bound versus baseline_free; fall back to baseline_free if no learned candidate is positive",
+    "holdout_used_for_selection": false
+  },
+  "champion": {
+    "candidate": "baseline_free",
+    "policy": "points_only_free_only",
+    "config": null,
+    "selection_reason": "No learned cocktail had a positive paired 95% lower confidence bound versus the free-transfer anchor on temporal development folds.",
+    "model_path": "assets/action-policy-model.joblib"
+  },
+  "development_summary": [
+    {
+      "candidate": "baseline_free",
+      "runs": 6,
+      "mean_net_points": 2037.1666666666667,
+      "std_net_points": 43.66316779875484,
+      "p10_net_points": 1999.0,
+      "median_net_points": 2035.0,
+      "mean_hit_points": 0.0,
+      "mean_paid_transfers": 0.0,
+      "mean_chip_uses": 0.0,
+      "mean_delta_vs_free_anchor": 0.0,
+      "std_delta_vs_free_anchor": 0.0,
+      "paired_lcb95_vs_free_anchor": 0.0,
+      "wins_vs_free_anchor": 0,
+      "losses_vs_free_anchor": 0
+    },
+    {
+      "candidate": "baseline_price_hits",
+      "runs": 6,
+      "mean_net_points": 1924.3333333333333,
+      "std_net_points": 38.02922852520443,
+      "p10_net_points": 1884.0,
+      "median_net_points": 1924.5,
+      "mean_hit_points": 145.33333333333334,
+      "mean_paid_transfers": 36.333333333333336,
+      "mean_chip_uses": 0.0,
+      "mean_delta_vs_free_anchor": -112.83333333333333,
+      "std_delta_vs_free_anchor": 55.104194234397646,
+      "paired_lcb95_vs_free_anchor": -161.13428920149164,
+      "wins_vs_free_anchor": 0,
+      "losses_vs_free_anchor": 6
+    },
+    {
+      "candidate": "cocktail_anchor",
+      "runs": 6,
+      "mean_net_points": 2052.8333333333335,
+      "std_net_points": 47.64597452974269,
+      "p10_net_points": 2013.5,
+      "median_net_points": 2044.0,
+      "mean_hit_points": 0.0,
+      "mean_paid_transfers": 0.0,
+      "mean_chip_uses": 1.8333333333333333,
+      "mean_delta_vs_free_anchor": 15.666666666666666,
+      "std_delta_vs_free_anchor": 37.44180669904817,
+      "paired_lcb95_vs_free_anchor": -17.152523925288996,
+      "wins_vs_free_anchor": 4,
+      "losses_vs_free_anchor": 2
+    },
+    {
+      "candidate": "cocktail_balanced",
+      "runs": 6,
+      "mean_net_points": 2043.0,
+      "std_net_points": 55.74047003748713,
+      "p10_net_points": 1999.0,
+      "median_net_points": 2013.5,
+      "mean_hit_points": 0.0,
+      "mean_paid_transfers": 0.0,
+      "mean_chip_uses": 1.6666666666666667,
+      "mean_delta_vs_free_anchor": 5.833333333333333,
+      "std_delta_vs_free_anchor": 80.33143151275775,
+      "paired_lcb95_vs_free_anchor": -64.58027097088555,
+      "wins_vs_free_anchor": 1,
+      "losses_vs_free_anchor": 5
+    },
+    {
+      "candidate": "cocktail_cautious",
+      "runs": 6,
+      "mean_net_points": 2053.8333333333335,
+      "std_net_points": 58.339285410623795,
+      "p10_net_points": 1993.0,
+      "median_net_points": 2052.0,
+      "mean_hit_points": 0.0,
+      "mean_paid_transfers": 0.0,
+      "mean_chip_uses": 1.8333333333333333,
+      "mean_delta_vs_free_anchor": 16.666666666666668,
+      "std_delta_vs_free_anchor": 38.8915872079754,
+      "paired_lcb95_vs_free_anchor": -17.423312571291877,
+      "wins_vs_free_anchor": 4,
+      "losses_vs_free_anchor": 2
+    },
+    {
+      "candidate": "cocktail_selective_chips",
+      "runs": 6,
+      "mean_net_points": 2099.3333333333335,
+      "std_net_points": 94.96081063025713,
+      "p10_net_points": 1975.0,
+      "median_net_points": 2131.5,
+      "mean_hit_points": 0.0,
+      "mean_paid_transfers": 0.0,
+      "mean_chip_uses": 3.8333333333333335,
+      "mean_delta_vs_free_anchor": 62.166666666666664,
+      "std_delta_vs_free_anchor": 93.02045772600539,
+      "paired_lcb95_vs_free_anchor": -19.369359508542807,
+      "wins_vs_free_anchor": 4,
+      "losses_vs_free_anchor": 2
+    },
+    {
+      "candidate": "cocktail_win",
+      "runs": 6,
+      "mean_net_points": 2037.5,
+      "std_net_points": 68.83494751941052,
+      "p10_net_points": 1977.5,
+      "median_net_points": 2013.5,
+      "mean_hit_points": 0.0,
+      "mean_paid_transfers": 0.0,
+      "mean_chip_uses": 2.5,
+      "mean_delta_vs_free_anchor": 0.3333333333333333,
+      "std_delta_vs_free_anchor": 91.87068206028637,
+      "paired_lcb95_vs_free_anchor": -80.19487003528641,
+      "wins_vs_free_anchor": 3,
+      "losses_vs_free_anchor": 3
+    },
+    {
+      "candidate": "raw_neural",
+      "runs": 6,
+      "mean_net_points": 2074.0,
+      "std_net_points": 50.14312847572769,
+      "p10_net_points": 2024.0,
+      "median_net_points": 2063.5,
+      "mean_hit_points": 0.0,
+      "mean_paid_transfers": 0.0,
+      "mean_chip_uses": 3.3333333333333335,
+      "mean_delta_vs_free_anchor": 36.833333333333336,
+      "std_delta_vs_free_anchor": 75.86263170289367,
+      "paired_lcb95_vs_free_anchor": -29.663195231029427,
+      "wins_vs_free_anchor": 3,
+      "losses_vs_free_anchor": 3
+    }
+  ],
+  "holdout_summary": [
+    {
+      "candidate": "baseline_free",
+      "runs": 2,
+      "mean_net_points": 2001.0,
+      "std_net_points": 35.0,
+      "p10_net_points": 1973.0,
+      "median_net_points": 2001.0,
+      "mean_hit_points": 0.0,
+      "mean_paid_transfers": 0.0,
+      "mean_chip_uses": 0.0,
+      "mean_delta_vs_free_anchor": 0.0,
+      "std_delta_vs_free_anchor": 0.0,
+      "paired_lcb95_vs_free_anchor": 0.0,
+      "wins_vs_free_anchor": 0,
+      "losses_vs_free_anchor": 0
+    },
+    {
+      "candidate": "raw_neural",
+      "runs": 2,
+      "mean_net_points": 1960.5,
+      "std_net_points": 19.5,
+      "p10_net_points": 1944.9,
+      "median_net_points": 1960.5,
+      "mean_hit_points": 0.0,
+      "mean_paid_transfers": 0.0,
+      "mean_chip_uses": 3.0,
+      "mean_delta_vs_free_anchor": -40.5,
+      "std_delta_vs_free_anchor": 54.5,
+      "paired_lcb95_vs_free_anchor": -147.32,
+      "wins_vs_free_anchor": 1,
+      "losses_vs_free_anchor": 1
+    }
+  ],
+  "context": {
+    "events": 0,
+    "news_events": 0,
+    "social_events": 0,
+    "sources": [],
+    "first_published_at": null,
+    "last_published_at": null
+  },
+  "candidates": {
+    "baseline_free": {
+      "policy": "points_only_free_only",
+      "config": null
+    },
+    "baseline_price_hits": {
+      "policy": "price_aware",
+      "config": null
+    },
+    "raw_neural": {
+      "policy": "neural",
+      "config": null
+    },
+    "cocktail_cautious": {
+      "policy": "cocktail",
+      "config": {
+        "name": "cocktail_cautious",
+        "anchor_policy": "points_only_free_only",
+        "model_risk_aversion": 0.45,
+        "model_weight": 0.7,
+        "risk_penalty": 0.2,
+        "transfer_gate": 2.0,
+        "chip_gate": 6.0,
+        "hit_gate": 9.0,
+        "anchor_tolerance": 0.1,
+        "allow_hits": false,
+        "allow_chips": true,
+        "min_chip_gameweek": 2,
+        "max_chip_gameweek": 36
+      }
+    },
+    "cocktail_anchor": {
+      "policy": "cocktail",
+      "config": {
+        "name": "cocktail_anchor",
+        "anchor_policy": "points_only_free_only",
+        "model_risk_aversion": 0.3,
+        "model_weight": 0.75,
+        "risk_penalty": 0.1,
+        "transfer_gate": 1.0,
+        "chip_gate": 4.0,
+        "hit_gate": 7.0,
+        "anchor_tolerance": 0.1,
+        "allow_hits": false,
+        "allow_chips": true,
+        "min_chip_gameweek": 2,
+        "max_chip_gameweek": 36
+      }
+    },
+    "cocktail_selective_chips": {
+      "policy": "cocktail",
+      "config": {
+        "name": "cocktail_selective_chips",
+        "anchor_policy": "points_only_free_only",
+        "model_risk_aversion": 0.35,
+        "model_weight": 0.8,
+        "risk_penalty": 0.15,
+        "transfer_gate": 999.0,
+        "chip_gate": 3.5,
+        "hit_gate": 9.0,
+        "anchor_tolerance": 0.1,
+        "allow_hits": false,
+        "allow_chips": true,
+        "min_chip_gameweek": 2,
+        "max_chip_gameweek": 36
+      }
+    },
+    "cocktail_balanced": {
+      "policy": "cocktail",
+      "config": {
+        "name": "cocktail_balanced",
+        "anchor_policy": "points_only_free_only",
+        "model_risk_aversion": 0.15,
+        "model_weight": 0.55,
+        "risk_penalty": 0.06,
+        "transfer_gate": 0.25,
+        "chip_gate": 2.5,
+        "hit_gate": 6.0,
+        "anchor_tolerance": 0.1,
+        "allow_hits": false,
+        "allow_chips": true,
+        "min_chip_gameweek": 2,
+        "max_chip_gameweek": 36
+      }
+    },
+    "cocktail_win": {
+      "policy": "cocktail",
+      "config": {
+        "name": "cocktail_win",
+        "anchor_policy": "points_only_free_only",
+        "model_risk_aversion": 0.05,
+        "model_weight": 0.4,
+        "risk_penalty": 0.02,
+        "transfer_gate": 0.0,
+        "chip_gate": 1.5,
+        "hit_gate": 5.0,
+        "anchor_tolerance": 0.1,
+        "allow_hits": true,
+        "allow_chips": true,
+        "min_chip_gameweek": 2,
+        "max_chip_gameweek": 36
+      }
+    }
+  }
+}

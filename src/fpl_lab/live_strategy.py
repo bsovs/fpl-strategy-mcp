@@ -1,0 +1,591 @@
+"""Live current-squad adapter for the selected FPL hybrid strategy.
+
+This module is deliberately separate from the historical SeasonData simulator.
+The MCP tool receives a current squad, a buyable pool, and point-in-time
+signals directly, then applies the same legal/action-value/rank-leverage logic
+used by the synthetic strategy league.
+"""
+
+from __future__ import annotations
+
+from dataclasses import replace
+from typing import Any, Iterable
+
+import numpy as np
+
+from .decision import (
+    DecisionConfig,
+    PlayerSignal,
+    PlayerState,
+    TransferRecommendation,
+    recommend_transfers,
+    recommendation_to_dict,
+)
+from .league import HYBRID_PROFILES
+from .policy import ActionValueEnsemble, ActionValueMLP, PolicyAction, PolicyState
+from .simulator import CHIP_KINDS, recommendation_to_policy_action
+
+
+NEURAL_TYPES = (ActionValueMLP, ActionValueEnsemble)
+
+
+def _key(recommendation: TransferRecommendation) -> tuple[str, str]:
+    return recommendation.player_out_id, recommendation.player_in_id
+
+
+def _sigmoid(value: float) -> float:
+    value = float(np.clip(value, -50.0, 50.0))
+    return 1.0 / (1.0 + float(np.exp(-value)))
+
+
+def _model_scores(
+    model: ActionValueMLP | ActionValueEnsemble,
+    state: PolicyState,
+    actions: list[PolicyAction],
+    risk_aversion: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    if isinstance(model, ActionValueEnsemble):
+        means, uncertainty = model.predict_with_uncertainty([state] * len(actions), actions)
+    else:
+        means = model.predict([state] * len(actions), actions)
+        uncertainty = np.zeros(len(actions), dtype=float)
+    return means - risk_aversion * uncertainty, uncertainty
+
+
+def _candidate_union(
+    current_squad: list[PlayerState],
+    buyable_players: list[PlayerState],
+    signals: list[PlayerSignal],
+    config: DecisionConfig,
+    strategy: str,
+) -> list[TransferRecommendation]:
+    """Generate both neutral and differentiated candidate support."""
+
+    permissive = replace(config, min_move_score=-10.0, rank_mode="neutral")
+    neutral = recommend_transfers(current_squad, buyable_players, signals, permissive)
+    if strategy == "hybrid_win":
+        chase_config = replace(config, min_move_score=-10.0, rank_mode="chase")
+        chase = recommend_transfers(current_squad, buyable_players, signals, chase_config)
+    else:
+        chase = []
+    by_key: dict[tuple[str, str], TransferRecommendation] = {}
+    for recommendation in neutral + chase:
+        key = _key(recommendation)
+        current = by_key.get(key)
+        if current is None or recommendation.combined_score > current.combined_score:
+            by_key[key] = recommendation
+    return sorted(
+        by_key.values(),
+        key=lambda recommendation: recommendation.combined_score,
+        reverse=True,
+    )
+
+
+def _live_chip_bundle(
+    current_squad: list[PlayerState],
+    buyable_players: list[PlayerState],
+    signals: list[PlayerSignal],
+    config: DecisionConfig,
+    recommendations: list[TransferRecommendation],
+    max_depth: int = 2,
+) -> tuple[TransferRecommendation, ...]:
+    """Build a small sequentially legal wildcard/Free Hit plan.
+
+    The live adapter does not have the historical snapshot object used by the
+    simulator, so it recomputes the second move after applying the first move
+    to the supplied current squad and bank. The plan is intentionally capped;
+    the action model decides whether the chip is worth using, while the
+    returned plan remains inspectable and easy to verify.
+    """
+
+    selected: list[TransferRecommendation] = []
+    live_current = list(current_squad)
+    live_buyable = list(buyable_players)
+    live_bank = float(config.bank)
+    next_recommendations = list(recommendations)
+    for depth in range(max_depth):
+        used_out = {item.player_out_id for item in selected}
+        used_in = {item.player_in_id for item in selected}
+        recommendation = next(
+            (
+                item
+                for item in next_recommendations
+                if item.player_out_id not in used_out and item.player_in_id not in used_in
+            ),
+            None,
+        )
+        if recommendation is None:
+            break
+        selected.append(recommendation)
+        player_out = next(
+            (player for player in live_current if player.player_id == recommendation.player_out_id),
+            None,
+        )
+        player_in = next(
+            (player for player in live_buyable if player.player_id == recommendation.player_in_id),
+            None,
+        )
+        if player_out is None or player_in is None:
+            break
+        live_bank += player_out.sell_value - player_in.price
+        live_current = [player for player in live_current if player.player_id != player_out.player_id]
+        live_current.append(replace(player_in, selling_price=player_in.price))
+        live_buyable = [player for player in live_buyable if player.player_id != player_in.player_id]
+        if all(player.player_id != player_out.player_id for player in live_buyable):
+            live_buyable.append(replace(player_out, can_buy=True))
+        if depth + 1 >= max_depth:
+            break
+        recompute_config = replace(
+            config,
+            bank=live_bank,
+            free_transfers=15,
+            min_move_score=-10.0,
+            rank_mode="neutral",
+        )
+        next_recommendations = _candidate_union(
+            live_current,
+            live_buyable,
+            signals,
+            recompute_config,
+            "hybrid_win",
+        )
+    return tuple(selected)
+
+
+def _live_chip_action(
+    chip: str,
+    current_squad: list[PlayerState],
+    buyable_players: list[PlayerState],
+    signals: list[PlayerSignal],
+    config: DecisionConfig,
+    recommendations: list[TransferRecommendation],
+) -> tuple[PolicyAction, dict[str, Any]]:
+    """Create an action-model candidate for a live chip decision."""
+
+    signal_by_id = {signal.player_id: signal for signal in signals}
+    bundle = (
+        _live_chip_bundle(current_squad, buyable_players, signals, config, recommendations)
+        if chip in {"wildcard", "free_hit"}
+        else ()
+    )
+    if chip == "bench_boost":
+        # Without historical fixture snapshots, use the four lowest projected
+        # current-squad players as a conservative bench proxy. The simulator
+        # uses the exact legal lineup when training/backtesting.
+        current_signals = [signal_by_id[player.player_id] for player in current_squad]
+        bench = sorted(current_signals, key=lambda signal: signal.next_expected_points or signal.short_expected_points)[:4]
+        short_points = sum(signal.next_expected_points or signal.short_expected_points for signal in bench)
+        long_points = sum(signal.long_expected_points / 8.0 for signal in bench)
+    elif chip == "triple_captain":
+        current_signals = [signal_by_id[player.player_id] for player in current_squad]
+        captain = max(
+            current_signals,
+            key=lambda signal: signal.next_expected_points or signal.short_expected_points,
+        )
+        short_points = captain.next_expected_points or captain.short_expected_points
+        long_points = captain.long_expected_points / 8.0
+    else:
+        short_points = sum(item.short_gain for item in bundle)
+        long_points = (
+            sum(item.long_gain for item in bundle)
+            if chip != "free_hit"
+            else 0.0
+        )
+    short_price = sum(
+        signal_by_id[item.player_in_id].short_price_signal
+        - signal_by_id[item.player_out_id].short_price_signal
+        for item in bundle
+    )
+    long_price = (
+        sum(
+            signal_by_id[item.player_in_id].long_price_signal
+            - signal_by_id[item.player_out_id].long_price_signal
+            for item in bundle
+        )
+        if chip != "free_hit"
+        else 0.0
+    )
+    action = PolicyAction(
+        kind=chip,
+        short_points_delta=short_points,
+        long_points_delta=long_points,
+        short_price_delta=short_price,
+        long_price_delta=long_price,
+        ownership_leverage_delta=sum(
+            signal_by_id[item.player_in_id].ownership_leverage
+            - signal_by_id[item.player_out_id].ownership_leverage
+            for item in bundle
+        ),
+        legal=True,
+    )
+    return action, {
+        "chip": chip,
+        "bundle": bundle,
+        "short_points": float(short_points),
+        "long_points": float(long_points),
+        "short_price": float(short_price),
+        "long_price": float(long_price),
+    }
+
+
+def recommend_live_moves(
+    current_squad: Iterable[PlayerState],
+    buyable_players: Iterable[PlayerState],
+    signals: Iterable[PlayerSignal],
+    config: DecisionConfig,
+    gameweek: int,
+    strategy: str = "hybrid_win",
+    my_points: float | None = None,
+    leader_points: float | None = None,
+    league_size: int = 10,
+    model: ActionValueMLP | ActionValueEnsemble | None = None,
+    limit: int = 10,
+    chips_available: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    """Return legal current-week moves under a hybrid strategy.
+
+    ``hybrid_win`` is the title-seeking challenger. ``hybrid_safe`` and
+    ``hybrid_balanced`` remain available for comparisons. If no model is
+    supplied, the function falls back to the transparent legal heuristic and
+    marks that fact in the result.
+    """
+
+    if strategy == "champion":
+        # The frozen tournament champion is intentionally a points-first,
+        # free-transfer-only policy.  It returns no hit/chip recommendation;
+        # learned action variants remain available under their explicit names.
+        current = list(current_squad)
+        buyable = list(buyable_players)
+        signal_rows = list(signals)
+        signal_by_id = {signal.player_id: signal for signal in signal_rows}
+        if len(current) != 15:
+            raise ValueError(f"current_squad must contain exactly 15 players; received {len(current)}")
+        if int(config.free_transfers) < 1:
+            return {
+                "strategy": "champion",
+                "gameweek": int(gameweek),
+                "action": "hold",
+                "hold_reason": "The frozen champion does not recommend paid hits; no free transfer is available.",
+                "moves": [],
+                "state_summary": {
+                    "current_squad_size": len(current),
+                    "buyable_pool_size": len(buyable),
+                    "free_transfers": config.free_transfers,
+                    "chips_available": sorted(set(CHIP_KINDS if chips_available is None else chips_available)),
+                    "bank": config.bank,
+                },
+                "model_loaded": model is not None,
+                "warnings": [
+                    "Frozen champion selected by temporal tournament; it does not spend paid hits or chips.",
+                    "Learned action policies are challengers until they clear the same paired holdout guardrail.",
+                ],
+            }
+        champion_config = replace(
+            config,
+            short_weight=0.70,
+            long_weight=0.30,
+            price_weight=0.0,
+            ownership_weight=0.0,
+            min_move_score=max(0.15, config.min_move_score),
+            rank_mode="neutral",
+        )
+        recommendations = recommend_transfers(current, buyable, signal_rows, champion_config)
+        recommendations = [item for item in recommendations if item.hit_cost <= 0.0][: int(limit)]
+        rows = []
+        for recommendation in recommendations:
+            row = recommendation_to_dict(recommendation)
+            row.update(
+                {
+                    "action": "make_transfer",
+                    "decision": "make",
+                    "strategy_score": round(float(np.tanh(recommendation.combined_score / 6.0)), 4),
+                    "model_advantage": None,
+                    "model_uncertainty": None,
+                    "why": list(recommendation.why),
+                }
+            )
+            rows.append(row)
+        if not rows:
+            return {
+                "strategy": "champion",
+                "gameweek": int(gameweek),
+                "action": "hold",
+                "hold_reason": "No free-transfer move cleared the champion's points-first threshold.",
+                "moves": [],
+                "state_summary": {
+                    "current_squad_size": len(current),
+                    "buyable_pool_size": len(buyable),
+                    "free_transfers": config.free_transfers,
+                    "chips_available": sorted(set(CHIP_KINDS if chips_available is None else chips_available)),
+                    "bank": config.bank,
+                },
+                "model_loaded": model is not None,
+                "warnings": [
+                    "Frozen champion selected by temporal tournament; hold is an intentional action.",
+                    "The champion is validated for points/risk robustness, not guaranteed to win every mini-league.",
+                ],
+            }
+        return {
+            "strategy": "champion",
+            "gameweek": int(gameweek),
+            "action": "make_transfer",
+            "recommended_move": rows[0],
+            "moves": rows,
+            "state_summary": {
+                "current_squad_size": len(current),
+                "buyable_pool_size": len(buyable),
+                "free_transfers": config.free_transfers,
+                "chips_available": sorted(set(CHIP_KINDS if chips_available is None else chips_available)),
+                "bank": config.bank,
+                "my_points": my_points,
+                "leader_points": leader_points,
+            },
+            "model_loaded": model is not None,
+            "warnings": [
+                "Frozen champion selected by temporal tournament; it uses points, legality, prices, and the free-transfer constraint.",
+                "It does not spend paid hits or chips because those overrides were not robustly validated on held-out seasons.",
+                "Learned action policies remain available as explicit challengers.",
+            ],
+        }
+
+    if strategy not in HYBRID_PROFILES:
+        raise ValueError(f"strategy must be one of ['champion', *sorted(HYBRID_PROFILES)]")
+    if not 1 <= int(gameweek) <= 38:
+        raise ValueError("gameweek must be between 1 and 38")
+    current = list(current_squad)
+    buyable = list(buyable_players)
+    signal_rows = list(signals)
+    if len(current) != 15:
+        raise ValueError(f"current_squad must contain exactly 15 players; received {len(current)}")
+    available_chips = set(CHIP_KINDS if chips_available is None else chips_available)
+    unknown_chips = available_chips - set(CHIP_KINDS)
+    if unknown_chips:
+        raise ValueError(f"unknown chips: {sorted(unknown_chips)}")
+    signal_by_id = {signal.player_id: signal for signal in signal_rows}
+    missing_signals = sorted(
+        {player.player_id for player in current + buyable} - set(signal_by_id)
+    )
+    if missing_signals:
+        raise ValueError(f"missing signals for player IDs: {missing_signals[:10]}")
+    if int(limit) < 1:
+        raise ValueError("limit must be positive")
+    profile = HYBRID_PROFILES[strategy]
+    recommendations = _candidate_union(current, buyable, signal_rows, config, strategy)
+    # The live tool intentionally caps model evaluation. The transparent
+    # heuristic has already sorted all legal pairs; 120 candidates is enough to
+    # preserve diverse same-position options without making a current-week
+    # request slow.
+    recommendations = recommendations[:120]
+
+    if my_points is None:
+        my_points = 0.0
+    if leader_points is None:
+        leader_points = float(my_points)
+    league_size = max(1, int(league_size))
+    deficit = max(0.0, float(leader_points) - float(my_points))
+    behind = float(np.clip(deficit / max(20.0, 10.0 * league_size), 0.0, 1.0))
+    leading = float(
+        np.clip(max(0.0, float(my_points) - float(leader_points)) / 30.0, 0.0, 1.0)
+    )
+
+    state = PolicyState(
+        gameweek=int(gameweek),
+        weeks_remaining=max(0, 38 - int(gameweek) + 1),
+        bank=float(config.bank),
+        free_transfers=int(config.free_transfers),
+        squad_value=sum(player.price for player in current),
+        # The neural model was trained with neutral rank-mode encoding. The
+        # league gap is applied below as a controlled decision overlay instead
+        # of sending an out-of-distribution rank-mode value into the network.
+        rank_percentile=0.5,
+        target_rank_percentile=0.5,
+        rank_mode="neutral",
+        chip_flexibility=len(available_chips) / len(CHIP_KINDS),
+        wildcard_available="wildcard" in available_chips,
+        free_hit_available="free_hit" in available_chips,
+        bench_boost_available="bench_boost" in available_chips,
+        triple_captain_available="triple_captain" in available_chips,
+    )
+    hold_action = PolicyAction(kind="hold")
+    action_rows: list[tuple[PolicyAction, TransferRecommendation | None, dict[str, Any] | None]] = [
+        (hold_action, None, None),
+        *[
+            (recommendation_to_policy_action(recommendation, signal_by_id), recommendation, None)
+            for recommendation in recommendations
+        ],
+    ]
+    for chip in CHIP_KINDS:
+        if chip not in available_chips:
+            continue
+        chip_action, chip_meta = _live_chip_action(
+            chip,
+            current,
+            buyable,
+            signal_rows,
+            config,
+            recommendations,
+        )
+        action_rows.append((chip_action, None, chip_meta))
+    if model is not None and not isinstance(model, NEURAL_TYPES):
+        raise TypeError("model must be ActionValueMLP, ActionValueEnsemble, or None")
+    if model is None:
+        model_scores = np.zeros(len(action_rows), dtype=float)
+        model_uncertainty = np.zeros(len(action_rows), dtype=float)
+    else:
+        model_scores, model_uncertainty = _model_scores(
+            model,
+            state,
+            [action for action, _recommendation, _chip_meta in action_rows],
+            profile.model_risk_aversion,
+        )
+    hold_score = float(model_scores[0])
+    moves = []
+    for index, (action, recommendation, chip_meta) in enumerate(action_rows[1:], start=1):
+        if recommendation is None:
+            if chip_meta is None or model is None:
+                # The transparent fallback can rank transfers, but should not
+                # pretend it knows optimal chip timing without the trained
+                # action-value model.
+                continue
+            model_edge = float(model_scores[index] - hold_score)
+            uncertainty = float(model_uncertainty[index])
+            if model_edge < profile.min_model_advantage:
+                continue
+            heuristic_score = float(
+                np.tanh(
+                    (chip_meta["short_points"] + 0.35 * chip_meta["long_points"])
+                    / 6.0
+                )
+            )
+            score = (
+                profile.model_weight * float(np.tanh(model_edge / 6.0))
+                + (1.0 - profile.model_weight) * heuristic_score
+                - profile.risk_penalty * uncertainty
+            )
+            if score < profile.minimum_score:
+                continue
+            plan = [recommendation_to_dict(item) for item in chip_meta["bundle"]]
+            moves.append(
+                {
+                    "action": "use_chip",
+                    "chip": chip_meta["chip"],
+                    "chip_plan": plan,
+                    "chip_forecast_short": round(chip_meta["short_points"], 3),
+                    "chip_forecast_long": round(chip_meta["long_points"], 3),
+                    "strategy_score": round(score, 4),
+                    "model_advantage": round(model_edge, 4),
+                    "model_uncertainty": round(uncertainty, 4),
+                    "ownership_leverage_delta": round(action.ownership_leverage_delta, 4),
+                    "league_deficit": round(deficit, 2),
+                    "behind_factor": round(behind, 4),
+                    "combined_score": round(
+                        chip_meta["short_points"] + chip_meta["long_points"], 4
+                    ),
+                    "decision": "use_chip",
+                    "why": (
+                        "action model prefers this chip to holding",
+                        "chip value is evaluated alongside transfer and hold actions",
+                    ),
+                }
+            )
+            continue
+        model_edge = float(model_scores[index] - hold_score)
+        if recommendation.hit_cost > 0.0:
+            hit_gate = profile.hit_model_advantage - 1.25 * behind + 0.75 * leading
+            if model is None or model_edge < hit_gate:
+                continue
+        heuristic_score = float(np.tanh(recommendation.combined_score / 6.0))
+        model_component = float(np.tanh(model_edge / 6.0)) if model is not None else 0.0
+        in_signal = signal_by_id[recommendation.player_in_id]
+        out_signal = signal_by_id[recommendation.player_out_id]
+        leverage = float(in_signal.ownership_leverage - out_signal.ownership_leverage)
+        game_theory = profile.aggression * behind * leverage
+        uncertainty = float(model_uncertainty[index])
+        score = (
+            profile.model_weight * model_component
+            + (1.0 - profile.model_weight) * heuristic_score
+            + game_theory
+            - profile.risk_penalty * uncertainty
+        )
+        if score < profile.minimum_score:
+            continue
+        if model is not None and model_edge < profile.min_model_advantage:
+            # Preserve a clearly strong transparent move even if the learned
+            # model is not enthusiastic; otherwise require model confirmation.
+            if recommendation.combined_score < 1.0:
+                continue
+        row = recommendation_to_dict(recommendation)
+        row.update(
+            {
+                "strategy_score": round(score, 4),
+                "model_advantage": round(model_edge, 4),
+                "model_uncertainty": round(uncertainty, 4),
+                "ownership_leverage_delta": round(leverage, 4),
+                "league_deficit": round(deficit, 2),
+                "behind_factor": round(behind, 4),
+                "action": "make_transfer",
+                "decision": "make",
+            }
+        )
+        moves.append(row)
+    moves.sort(
+        key=lambda row: (
+            row["strategy_score"],
+            row["model_advantage"],
+            row.get("combined_score", row.get("chip_forecast_short", 0.0)),
+        ),
+        reverse=True,
+    )
+    warnings = [
+        "This is the development-selected hybrid_win challenger, not a proven global-winning policy.",
+        "The historical benchmark uses synthetic rival managers; it is not a claim of dominance over real FPL winners.",
+        "Live Bench Boost values use a four-player bench proxy; the historical simulator uses the exact legal lineup.",
+    ]
+    if model is None:
+        warnings.append("No action-value model was loaded; scores are heuristic/rank-leverage fallback scores.")
+    if not moves:
+        hold_reason = "No legal move cleared the strategy threshold after hit cost, uncertainty, and league-gap checks."
+        if config.free_transfers <= 0:
+            hold_reason += " You have no free transfer, so a hit would need unusually strong evidence."
+        return {
+            "strategy": strategy,
+            "gameweek": int(gameweek),
+            "action": "hold",
+            "hold_reason": hold_reason,
+            "moves": [],
+            "state_summary": {
+                "current_squad_size": len(current),
+                "buyable_pool_size": len(buyable),
+                "free_transfers": config.free_transfers,
+                "chips_available": sorted(available_chips),
+                "bank": config.bank,
+                "my_points": my_points,
+                "leader_points": leader_points,
+                "league_deficit": deficit,
+                "behind_factor": behind,
+                "leading_factor": leading,
+            },
+            "model_loaded": model is not None,
+            "warnings": warnings,
+        }
+    return {
+        "strategy": strategy,
+        "gameweek": int(gameweek),
+        "action": "use_chip" if moves[0].get("action") == "use_chip" else "make_transfer",
+        "recommended_move": moves[0],
+        "moves": moves[: int(limit)],
+        "state_summary": {
+            "current_squad_size": len(current),
+            "buyable_pool_size": len(buyable),
+            "free_transfers": config.free_transfers,
+            "chips_available": sorted(available_chips),
+            "bank": config.bank,
+            "my_points": my_points,
+            "leader_points": leader_points,
+            "league_deficit": deficit,
+            "behind_factor": behind,
+            "leading_factor": leading,
+        },
+        "model_loaded": model is not None,
+        "warnings": warnings,
+    }
