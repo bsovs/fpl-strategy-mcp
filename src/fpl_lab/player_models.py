@@ -215,6 +215,11 @@ def build_player_feature_table(raw: pd.DataFrame) -> pd.DataFrame:
         frame[column] = _numeric(frame, column)
     frame = frame.sort_values(["season_order", "gameweek", "kickoff_time", "player_key"]).reset_index(drop=True)
     frame["sequence"] = frame["season_order"] * 100 + frame["gameweek"]
+    # Historical context must be cut off at the simulated FPL deadline, not
+    # at kickoff.  Use the first fixture of the gameweek so a later
+    # double-gameweek article cannot leak into the original transfer decision.
+    first_kickoff = frame.groupby(["season", "gameweek"], sort=False)["kickoff_time"].transform("min")
+    frame["decision_time"] = first_kickoff - pd.Timedelta(minutes=90)
 
     grouped = frame.groupby("player_key", sort=False)
     source_features = [
@@ -396,6 +401,8 @@ def _add_context_features(frame: pd.DataFrame, context_store: object | None) -> 
     context_columns = (
         "news_availability_delta",
         "news_role_security_delta",
+        "context_set_piece_delta",
+        "context_transfer_role_delta",
         "news_risk",
         "news_sentiment",
         "social_sentiment",
@@ -416,12 +423,14 @@ def _add_context_features(frame: pd.DataFrame, context_store: object | None) -> 
             player_id,
             str(row["name"]),
             str(row["team"]),
-            row["kickoff_time"],
+            row.get("decision_time", row["kickoff_time"]),
         )
         rows.append(
             {
                 "news_availability_delta": features.availability_delta,
                 "news_role_security_delta": features.role_security_delta,
+                "context_set_piece_delta": features.set_piece_delta,
+                "context_transfer_role_delta": features.transfer_role_delta,
                 "news_risk": features.news_risk,
                 "news_sentiment": features.news_sentiment,
                 "social_sentiment": features.social_sentiment,
@@ -653,6 +662,13 @@ def build_extended_player_feature_table(
         *std_features,
         *derived_features,
     ]
+    # Availability targets are gameweek-level outcomes.  Keeping them under
+    # explicit target names prevents the current realized minutes from being
+    # accidentally included in the predictor feature list.
+    player_gameweeks["target_minutes_gw"] = player_gameweeks["minutes"]
+    player_gameweeks["target_starts_gw"] = player_gameweeks["starts"]
+    player_gameweeks["target_played_gw"] = (player_gameweeks["minutes"] > 0).astype(float)
+    feature_columns.extend(["target_minutes_gw", "target_starts_gw", "target_played_gw"])
     frame = _broadcast_player_gameweek_features(frame, player_gameweeks, feature_columns)
     frame["points_ewma_5"] = frame["total_points_ewma_5"]
     frame["points_mean_3"] = frame["total_points_mean_3"]
@@ -681,25 +697,43 @@ def build_extended_player_feature_table(
     # realized points to distinct player/gameweek rows first, so a double GW
     # contributes both fixtures exactly once to the 3- and 8-GW targets.
     horizon_labels = (
-        frame.groupby(["player_season_key", "season_order", "gameweek", "sequence"], as_index=False, sort=False)[
-            "total_points"
-        ]
-        .sum()
-        .rename(columns={"total_points": "gameweek_points"})
+        frame.groupby(["player_season_key", "season_order", "gameweek", "sequence"], as_index=False, sort=False)
+        .agg(
+            gameweek_points=("total_points", "sum"),
+            gameweek_minutes=("minutes", "sum"),
+            gameweek_starts=("starts", "sum"),
+        )
         .sort_values(["player_season_key", "gameweek"])
     )
     point_lookup = horizon_labels.set_index(["player_season_key", "gameweek"])["gameweek_points"]
+    minutes_lookup = horizon_labels.set_index(["player_season_key", "gameweek"])["gameweek_minutes"]
+    starts_lookup = horizon_labels.set_index(["player_season_key", "gameweek"])["gameweek_starts"]
     for horizon in (3, 8):
         total = np.zeros(len(horizon_labels), dtype=float)
+        minutes_total = np.zeros(len(horizon_labels), dtype=float)
+        starts_total = np.zeros(len(horizon_labels), dtype=float)
         for offset in range(horizon):
             lookup_keys = pd.MultiIndex.from_arrays(
                 [horizon_labels["player_season_key"], horizon_labels["gameweek"] + offset]
             )
             total += point_lookup.reindex(lookup_keys).fillna(0.0).to_numpy()
+            minutes_total += minutes_lookup.reindex(lookup_keys).fillna(0.0).to_numpy()
+            starts_total += starts_lookup.reindex(lookup_keys).fillna(0.0).to_numpy()
         horizon_labels[f"target_horizon_points_{horizon}"] = total
+        horizon_labels[f"target_horizon_minutes_{horizon}"] = minutes_total
+        horizon_labels[f"target_horizon_starts_{horizon}"] = starts_total
     frame = frame.merge(
         horizon_labels[
-            ["player_season_key", "sequence", "target_horizon_points_3", "target_horizon_points_8"]
+            [
+                "player_season_key",
+                "sequence",
+                "target_horizon_points_3",
+                "target_horizon_points_8",
+                "target_horizon_minutes_3",
+                "target_horizon_minutes_8",
+                "target_horizon_starts_3",
+                "target_horizon_starts_8",
+            ]
         ],
         on=["player_season_key", "sequence"],
         how="left",
@@ -719,7 +753,7 @@ def build_extended_player_feature_table(
         .set_index(["season_order", "team", "gameweek"])
     )
     base_schedule_keys = [frame["season_order"], frame["team"], frame["gameweek"]]
-    for horizon in (3, 5):
+    for horizon in (2, 3, 5, 7, 8):
         fixture_counts = np.zeros(len(frame), dtype=float)
         home_counts = np.zeros(len(frame), dtype=float)
         for offset in range(1, horizon + 1):
@@ -808,10 +842,16 @@ EXTENDED_NUMERIC_FEATURES = list(
             "gameweek",
             "season_order",
             "fixtures_current_gw",
+            "fixtures_next_2",
             "fixtures_next_3",
             "fixtures_next_5",
+            "fixtures_next_7",
+            "fixtures_next_8",
+            "home_share_next_2",
             "home_share_next_3",
             "home_share_next_5",
+            "home_share_next_7",
+            "home_share_next_8",
             "form_acceleration",
             "minutes_trend",
             "start_rate_5",
@@ -834,6 +874,8 @@ EXTENDED_NUMERIC_FEATURES = list(
             *[f"{column}_observed" for column in EXTENDED_SOURCE_FEATURES],
             "news_availability_delta",
             "news_role_security_delta",
+            "context_set_piece_delta",
+            "context_transfer_role_delta",
             "news_risk",
             "news_sentiment",
             "social_sentiment",

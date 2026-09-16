@@ -232,12 +232,23 @@ sufficient.
 ## 5. News, social context, and price information
 
 The input contract supports point-in-time `news_sentiment`, `news_risk`,
-`social_sentiment`, `context_reliability`, event counts, and triggers. The
-production server does not silently scrape Twitter/X or news. A caller must
-provide timestamped, leakage-safe context or explicitly request the transparent
-official-bootstrap fallback. The fallback uses official availability, form,
-price, ownership, and transfer fields; it is not a replacement for a trained
-expected-minutes or news model.
+`social_sentiment`, `context_reliability`, event counts, and triggers. It now
+also keeps separate role signals for `set_piece` events (penalties, direct
+free-kicks, corners, and dead balls) and `transfer` events, plus explicit
+`lineup_predicted`, `lineup_confirmed`, and `lineup_benched` event types. These
+signals feed availability, role, and transfer scores instead of being reduced
+to generic sentiment.
+
+The production server does not silently scrape Twitter/X or news. A caller
+must provide timestamped, leakage-safe context or explicitly request the
+transparent official-bootstrap fallback. Historical feature construction uses
+the simulated FPL deadline—90 minutes before the first fixture of the
+gameweek—not kickoff. The public `Randdalf/fplcache` bootstrap snapshot archive
+can now be converted into official-news events with an `observed_at` archive
+timestamp. It is useful for availability and FPL-news replay, but it does not
+replace a complete historical expected-minutes, press-conference, lineup, or
+social model. See `docs/context-data-contract.md` for the event schema and
+ingestion rules.
 
 Price is treated as an input and a future-state concern. The current
 walk-forward price-change model is wired into the action bridge and evaluated
@@ -258,8 +269,9 @@ replay.
 4. The live lineup path uses the legal formation optimizer over the supplied
    forecast signals; final autosubs remain dependent on confirmed minutes and
    late team news.
-5. News and social fields are supported by the schema but are not a validated,
-   continuously ingested production feature set in this release.
+5. News and social fields are supported by the schema and deadline-aware
+   ingestion path, but this release does not contain a complete historical
+   event archive or a validated continuously ingested sentiment model.
 6. “Going for the win” needs a real league-state distribution and rival-action
    model. Ownership leverage is a useful signal, not a complete game-theoretic
    equilibrium.

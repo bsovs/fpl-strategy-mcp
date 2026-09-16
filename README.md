@@ -201,11 +201,15 @@ PYTHONPATH=src python scripts/train_action_policy.py \
   --forecast-model neural
 ```
 
+When backdated archives are available, add `--news-context PATH` and/or
+`--social-context PATH` to that command.
+
 This generates legal counterfactual action labels, fits the action ensemble,
 and evaluates neural actions against the free-transfer anchor over points,
 value, template, and randomized opening squads. The forecast bridge is
-walk-forward: it fits point forecasts, direct 3/8-gameweek totals, and a
-next-gameweek price-change model using only earlier seasons. The current
+walk-forward: it fits point forecasts, direct 3/8-gameweek totals, a
+next-gameweek price-change model, and a separate expected-minutes model using
+only earlier seasons. The current
 career-feature baseline produced 1,476 development and 186 validation
 examples. After fixing two temporal-grain defects—calendar-window horizon
 labels and double-gameweek lag aggregation—the clean untouched 2025/26 replay
@@ -215,6 +219,15 @@ opening of 2,156. The free-transfer anchor averaged 2,008.5 and peaked at
 the anchor in this replay, but the best result is still 257 points below the
 2,413 research target. This remains a research artifact, not a promoted
 champion.
+
+The context files are optional. Each event must carry a publication timestamp;
+the feature builder cuts it off at the simulated gameweek deadline (90 minutes
+before the first fixture), not at kickoff. Supported structured event types
+include `injury`, `availability`, `suspension`, `rotation`,
+`lineup_predicted`, `lineup_confirmed`, `lineup_benched`, `set_piece`, and
+`transfer`. Store the analyzed sentiment, source, reliability, player/team
+entity, and expiry alongside the text so the backtest can audit what was known.
+See `docs/context-data-contract.md`.
 
 For a model-family ablation, add `--forecast-model ridge`. The expanded ridge
 run reached 2,189 points in an earlier replay, but that result used the
@@ -238,7 +251,9 @@ and model selection.
 The important gaps are contextual rather than raw player rows. The historical
 archive does not provide a complete timestamped expected-minutes history,
 confirmed team-news/social stream, richer historical fixture-strength feed, or
-real rival-manager actions. The oldest gameweek files also need season-level
+real rival-manager actions. The pipeline now has a leakage-safe expected-
+minutes ablation, but it is not yet a validated strategy improvement. The
+oldest gameweek files also need season-level
 roster snapshots to fill team/position metadata; those rows are flagged and
 are not treated as point-in-time transfer history. Consequently, news/social
 signals are available in the input contract and live ingestion path, but are

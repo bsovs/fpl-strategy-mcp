@@ -65,6 +65,8 @@ class PlayerSignal:
     news_risk: float = 0.0
     news_sentiment: float = 0.0
     social_sentiment: float = 0.0
+    set_piece_signal: float = 0.0
+    transfer_role_signal: float = 0.0
     context_reliability: float = 0.0
     context_event_count: int = 0
     trigger: str = ""
@@ -162,6 +164,8 @@ def _player_score(
         "news_sentiment": 0.20 * _clip(signal.news_sentiment, -1.0, 1.0),
         # Social data is intentionally lower-weight than official/team news.
         "social_sentiment": 0.08 * _clip(signal.social_sentiment, -1.0, 1.0),
+        "set_piece_role": 0.35 * _clip(signal.set_piece_signal, -1.0, 1.0),
+        "transfer_role": 0.15 * _clip(signal.transfer_role_signal, -1.0, 1.0),
         "rotation_risk": -0.75 * _clip(signal.rotation_risk, 0.0, 1.0) * risk_aversion,
         "price_change_risk": -0.50 * _clip(signal.price_change_risk, 0.0, 1.0) * risk_aversion,
         "uncertainty": -0.50 * _clip(signal.uncertainty, 0.0, 1.0) * risk_aversion,
@@ -227,6 +231,8 @@ def _why(
             - (out_short_components["game_theory"] + out_long_components["game_theory"]),
         "news context": (short_components["news_risk"] + short_components["news_sentiment"])
             - (out_short_components["news_risk"] + out_short_components["news_sentiment"]),
+        "set-piece/role context": (short_components["set_piece_role"] + short_components["transfer_role"])
+            - (out_short_components["set_piece_role"] + out_short_components["transfer_role"]),
     }
     labels = {
         "short-term projection": "better short-term projection",
@@ -237,6 +243,7 @@ def _why(
         "price economics": "better price or bank-value outlook",
         "rank leverage": "better ownership/rank leverage",
         "news context": "better current news context",
+        "set-piece/role context": "better set-piece or transfer-role context",
     }
     positives = sorted(((value, labels[key]) for key, value in differences.items()), reverse=True)
     return tuple(label for value, label in positives if value > 0.05)[:3] or ("no strong factor advantage",)

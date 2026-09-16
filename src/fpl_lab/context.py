@@ -68,6 +68,27 @@ def _clip(value: float, low: float, high: float) -> float:
 
 def _infer_event_type(text: str) -> str:
     lowered = normalize_text(text)
+    if any(
+        phrase in lowered
+        for phrase in (
+            "penalty taker",
+            "penalties",
+            "free kick taker",
+            "free kicks",
+            "corner taker",
+            "set piece",
+            "dead ball",
+        )
+    ):
+        return "set_piece"
+    if any(phrase in lowered for phrase in ("confirmed lineup", "starting xi", "named in the xi", "named in xi")):
+        return "lineup_confirmed"
+    if any(phrase in lowered for phrase in ("predicted lineup", "expected to start", "line up to start")):
+        return "lineup_predicted"
+    if any(phrase in lowered for phrase in ("benched", "on the bench", "dropped from the xi", "not in the xi")):
+        return "lineup_benched"
+    if any(word in lowered for word in ("transfer", "transferred", "signed", "joins", "joined", "leaves", "departed")):
+        return "transfer"
     if any(word in lowered for word in ("injury", "injured", "knock", "fitness", "hamstring", "illness")):
         return "injury"
     if any(word in lowered for word in ("suspend", "ban", "red card")):
@@ -85,9 +106,41 @@ def _infer_event_type(text: str) -> str:
 
 def _infer_sentiment(text: str, event_type: str) -> float:
     lowered = normalize_text(text)
-    negative = ("injury", "injured", "doubt", "out", "suspend", "ban", "rotation", "benched", "miss")
-    positive = ("fit", "starts", "starting", "return", "back", "available", "signed")
+    negative = (
+        "injury",
+        "injured",
+        "doubt",
+        "out",
+        "suspend",
+        "ban",
+        "rotation",
+        "benched",
+        "dropped",
+        "miss",
+        "no longer",
+        "lost",
+    )
+    positive = (
+        "fit",
+        "starts",
+        "starting",
+        "return",
+        "back",
+        "available",
+        "signed",
+        "taker",
+        "assigned",
+        "named in",
+        "confirmed",
+    )
     score = sum(lowered.count(word) for word in positive) - sum(lowered.count(word) for word in negative)
+    if event_type == "set_piece" and score == 0:
+        score = 1 if any(word in lowered for word in ("takes", "on penalties", "on free kicks", "set piece")) else -1
+    if event_type == "transfer" and score == 0:
+        if any(phrase in lowered for phrase in ("transferred to", "loan", "departed", "leaves")):
+            score = -1
+        elif any(phrase in lowered for phrase in ("signed", "joined", "arrived")):
+            score = 1
     if event_type in {"injury", "suspension", "availability", "rotation"} and score >= 0:
         score = -1
     return _clip(score / 3.0, -1.0, 1.0)
@@ -124,11 +177,16 @@ class ContextEvent:
     author: str = ""
     engagement: float = 0.0
     verified: bool = False
+    # When a provider archive was observed separately from publication.  This
+    # prevents a cache snapshot from making an event visible before the
+    # snapshot itself existed.
+    observed_at: datetime | None = None
 
     def to_record(self) -> dict[str, Any]:
         row = asdict(self)
         row["published_at"] = self.published_at.isoformat()
         row["expires_at"] = self.expires_at.isoformat() if self.expires_at else None
+        row["observed_at"] = self.observed_at.isoformat() if self.observed_at else None
         return row
 
 
@@ -138,6 +196,8 @@ class ContextFeatures:
 
     availability_delta: float = 0.0
     role_security_delta: float = 0.0
+    set_piece_delta: float = 0.0
+    transfer_role_delta: float = 0.0
     news_risk: float = 0.0
     news_sentiment: float = 0.0
     social_sentiment: float = 0.0
@@ -216,6 +276,8 @@ class ContextStore:
         for event in sorted(candidate_events, key=lambda item: (item.published_at, item.event_id)):
             if event.published_at > cutoff:
                 continue
+            if event.observed_at is not None and event.observed_at > cutoff:
+                continue
             if event.expires_at is not None and event.expires_at < cutoff:
                 continue
             event_player_id = str(event.player_id or "")
@@ -238,6 +300,8 @@ class ContextStore:
 
         availability_delta = 0.0
         role_delta = 0.0
+        set_piece_delta = 0.0
+        transfer_role_delta = 0.0
         news_risk = 0.0
         news_sentiment = 0.0
         social_sentiment = 0.0
@@ -258,10 +322,27 @@ class ContextStore:
                 availability_delta -= 0.20 * weight
                 role_delta -= 0.25 * weight
                 news_risk += 0.35 * weight
+            elif event_type == "lineup_confirmed":
+                availability_delta += 0.45 * weight
+                role_delta += 0.40 * weight
+                news_risk -= 0.20 * weight
+            elif event_type == "lineup_predicted":
+                availability_delta += 0.22 * weight
+                role_delta += 0.20 * weight
+            elif event_type == "lineup_benched":
+                availability_delta -= 0.40 * weight
+                role_delta -= 0.45 * weight
+                news_risk += 0.45 * weight
             elif event_type == "role_positive":
                 availability_delta += 0.20 * weight
                 role_delta += 0.25 * weight
                 news_risk -= 0.15 * weight
+            elif event_type == "set_piece":
+                set_piece_delta += event.sentiment * weight
+            elif event_type == "transfer":
+                # Transfers can change role and minutes, but are less direct
+                # evidence than a confirmed lineup or official injury note.
+                transfer_role_delta += 0.25 * event.sentiment * weight
             if event_type == "price":
                 price_pressure += event.sentiment * weight
             news_sentiment += event.sentiment * weight
@@ -277,6 +358,8 @@ class ContextStore:
         return ContextFeatures(
             availability_delta=_clip(availability_delta, -0.75, 0.50),
             role_security_delta=_clip(role_delta, -0.75, 0.50),
+            set_piece_delta=_clip(set_piece_delta, -1.0, 1.0),
+            transfer_role_delta=_clip(transfer_role_delta, -1.0, 1.0),
             news_risk=_clip(news_risk, 0.0, 1.0),
             news_sentiment=_clip(news_sentiment / max(1.0, total_weight), -1.0, 1.0),
             social_sentiment=_clip(social_sentiment / max(1.0, total_weight), -1.0, 1.0),
@@ -318,6 +401,7 @@ def _event_from_record(record: dict[str, Any], kind: str, index: int) -> Context
     )
     if published is None:
         raise ValueError(f"context record {index} is missing a valid published_at timestamp")
+    observed_at = parse_timestamp(record.get("observed_at") or record.get("fetched_at")) or published
     event_type = str(record.get("event_type") or "").strip() or _infer_event_type(f"{title} {body}")
     sentiment = _clip(
         _float(record.get("sentiment"), _infer_sentiment(f"{title} {body}", event_type)),
@@ -360,6 +444,7 @@ def _event_from_record(record: dict[str, Any], kind: str, index: int) -> Context
         author=str(record.get("author") or record.get("username") or ""),
         engagement=_float(engagement_value),
         verified=bool(record.get("verified", False)),
+        observed_at=observed_at,
     )
 
 
@@ -416,9 +501,13 @@ def bootstrap_news_events(bootstrap: dict[str, Any], fetched_at: datetime | None
         if not news:
             news = f"Official FPL status: {status or 'unknown'}; chance next round {chance_value:.0f}%"
         published = parse_timestamp(player.get("news_added")) or now
-        event_type = "availability" if chance_value < 75 or status in {"i", "s", "u"} else "general"
-        if chance_value < 25:
-            event_type = "injury"
+        inferred_type = _infer_event_type(news)
+        if inferred_type in {"transfer", "set_piece", "lineup_confirmed", "lineup_predicted", "lineup_benched"}:
+            event_type = inferred_type
+        else:
+            event_type = "availability" if chance_value < 75 or status in {"i", "s", "u"} else "general"
+            if chance_value < 25:
+                event_type = "injury"
         sentiment = _clip((chance_value - 50.0) / 50.0, -1.0, 1.0)
         events.append(
             _event_from_record(
@@ -435,6 +524,7 @@ def bootstrap_news_events(bootstrap: dict[str, Any], fetched_at: datetime | None
                     "sentiment": sentiment,
                     "reliability": 1.0,
                     "expires_at": (published + timedelta(hours=36)).isoformat(),
+                    "observed_at": now.isoformat(),
                 },
                 kind="news",
                 index=int(player.get("id", 0)),

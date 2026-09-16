@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 
 from fpl_lab.backtest import paired_match_bootstrap, run_temporal_backtest
-from fpl_lab.context import ContextStore
+from fpl_lab.context import ContextStore, bootstrap_news_events
 from fpl_lab.data import Match, load_matches, to_team_observations
 from fpl_lab.decision import DecisionConfig, PlayerSignal, PlayerState, recommend_transfers
 from fpl_lab.model import PoissonTeamGoalsModel
@@ -185,6 +185,20 @@ class FplLabTests(unittest.TestCase):
         gw1 = features[features["gameweek"] == 1]
         self.assertEqual(set(gw1["target_horizon_points_3"]), {6.0})
 
+    def test_expected_minutes_targets_use_one_aggregated_player_gameweek(self):
+        raw = pd.DataFrame(
+            [
+                {"name": "Player", "element": 8, "position": "MID", "team": 1, "opponent_team": 2, "kickoff_time": "2024-08-01T12:00:00Z", "was_home": True, "total_points": 1, "minutes": 90, "starts": 1, "value": 60, "season": "2024-25", "season_order": 2024, "gameweek": 1, "fixture": 1},
+                {"name": "Player", "element": 8, "position": "MID", "team": 1, "opponent_team": 3, "kickoff_time": "2024-08-04T12:00:00Z", "was_home": False, "total_points": 2, "minutes": 30, "starts": 0, "value": 60, "season": "2024-25", "season_order": 2024, "gameweek": 1, "fixture": 2},
+                {"name": "Player", "element": 8, "position": "MID", "team": 1, "opponent_team": 4, "kickoff_time": "2024-08-10T12:00:00Z", "was_home": True, "total_points": 3, "minutes": 45, "starts": 1, "value": 61, "season": "2024-25", "season_order": 2024, "gameweek": 2, "fixture": 3},
+            ]
+        )
+        features = build_extended_player_feature_table(raw)
+        gw1 = features[features["gameweek"] == 1]
+        self.assertEqual(set(gw1["target_minutes_gw"]), {120.0})
+        self.assertEqual(set(gw1["target_starts_gw"]), {1.0})
+        self.assertEqual(set(gw1["target_horizon_minutes_3"]), {165.0})
+
     def test_decision_layer_scores_legal_same_position_move(self):
         current = [PlayerState("out", "Out", "MID", "A", 7.0, 6.9)]
         buyable = [PlayerState("in", "In", "MID", "B", 6.8)]
@@ -269,6 +283,135 @@ class FplLabTests(unittest.TestCase):
         self.assertGreater(before.news_risk, 0.0)
         self.assertEqual(after_expiry.event_count, 0)
         self.assertEqual(before_future_event.event_count, 0)
+
+    def test_context_models_lineup_set_piece_and_transfer_events_as_of(self):
+        store = ContextStore.from_records(
+            [
+                {
+                    "event_id": "lineup",
+                    "published_at": "2026-09-01T10:00:00Z",
+                    "source": "official FPL",
+                    "title": "Confirmed starting XI",
+                    "player_id": "7",
+                    "player_name": "Player",
+                    "team": "1",
+                    "event_type": "lineup_confirmed",
+                },
+                {
+                    "event_id": "set-piece",
+                    "published_at": "2026-09-01T11:00:00Z",
+                    "source": "club",
+                    "title": "Player is the new penalty taker",
+                    "player_id": "7",
+                    "player_name": "Player",
+                    "team": "1",
+                },
+                {
+                    "event_id": "transfer",
+                    "published_at": "2026-09-01T12:00:00Z",
+                    "source": "Premier League",
+                    "title": "Player signed a new contract",
+                    "player_id": "7",
+                    "player_name": "Player",
+                    "team": "1",
+                    "event_type": "transfer",
+                    "sentiment": 1.0,
+                },
+            ],
+            kind="news",
+        )
+        features = store.features_for_player("7", "Player", "1", "2026-09-01T13:00:00Z")
+        self.assertGreater(features.availability_delta, 0.0)
+        self.assertGreater(features.set_piece_delta, 0.0)
+        self.assertGreater(features.transfer_role_delta, 0.0)
+
+    def test_bootstrap_news_preserves_structured_event_type(self):
+        events = bootstrap_news_events(
+            {
+                "elements": [
+                    {
+                        "id": 7,
+                        "web_name": "Player",
+                        "team": 1,
+                        "status": "a",
+                        "chance_of_playing_next_round": 100,
+                        "news": "Transferred to Celtic",
+                        "news_added": "2026-09-01T10:00:00Z",
+                    }
+                ]
+            },
+            fetched_at="2026-09-01T12:00:00Z",
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].event_type, "transfer")
+        self.assertEqual(events[0].observed_at.isoformat(), "2026-09-01T12:00:00+00:00")
+
+    def test_historical_context_uses_gameweek_deadline_not_kickoff(self):
+        raw = pd.DataFrame(
+            [
+                {
+                    "name": "Player",
+                    "element": 7,
+                    "position": "MID",
+                    "team": 1,
+                    "opponent_team": 2,
+                    "kickoff_time": "2026-09-01T12:00:00Z",
+                    "was_home": True,
+                    "total_points": 2,
+                    "season": "2026-27",
+                    "season_order": 2026,
+                    "gameweek": 1,
+                }
+            ]
+        )
+        late_event = ContextStore.from_records(
+            [
+                {
+                    "event_id": "late",
+                    "published_at": "2026-09-01T11:00:00Z",
+                    "source": "official FPL",
+                    "title": "Hamstring injury",
+                    "player_id": "7",
+                    "event_type": "injury",
+                }
+            ],
+            kind="news",
+        )
+        early_event = ContextStore.from_records(
+            [
+                {
+                    "event_id": "early",
+                    "published_at": "2026-09-01T10:00:00Z",
+                    "source": "official FPL",
+                    "title": "Hamstring injury",
+                    "player_id": "7",
+                    "event_type": "injury",
+                }
+            ],
+            kind="news",
+        )
+        late_features = build_extended_player_feature_table(raw, context_store=late_event)
+        early_features = build_extended_player_feature_table(raw, context_store=early_event)
+        self.assertEqual(float(late_features.iloc[0]["news_risk"]), 0.0)
+        self.assertGreater(float(early_features.iloc[0]["news_risk"]), 0.0)
+
+    def test_context_observed_at_cannot_precede_archive_snapshot(self):
+        store = ContextStore.from_records(
+            [
+                {
+                    "event_id": "observed-late",
+                    "published_at": "2026-09-01T09:00:00Z",
+                    "observed_at": "2026-09-01T11:00:00Z",
+                    "source": "archived bootstrap",
+                    "title": "Hamstring injury",
+                    "player_id": "7",
+                    "event_type": "injury",
+                }
+            ],
+            kind="news",
+        )
+        features = store.features_for_player("7", "Player", "1", "2026-09-01T10:00:00Z")
+        self.assertEqual(features.event_count, 0)
 
     def test_selling_price_rounds_profit_down(self):
         self.assertEqual(selling_price_tenths(75, 78), 76)

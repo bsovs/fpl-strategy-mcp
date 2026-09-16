@@ -30,7 +30,7 @@ gameweeks. A row count alone is therefore not a sufficient completeness check.
 | Pre-fix 3-GW target alignment | 293 distinct 2025/26 player-gameweek rows disagreed with the calendar-window target | High | Fixed: horizons now use calendar gameweeks and missing weeks contribute zero |
 | Pre-fix double-GW lag consistency | 416 player/gameweek groups had inconsistent lag fields; 189 had inconsistent five-gameweek rolling points | High | Fixed: aggregate to one player/gameweek row before lags/rollups, then broadcast |
 | Old metadata | Oldest files lack team/position in the gameweek rows | Medium | Filled from season roster snapshots and retain imputation flags |
-| Historical context | No complete timestamped expected-minutes, news/social, or rival-manager archive | High | Not fabricated; live schema accepts it, historical replay marks it absent |
+| Historical context | No complete timestamped expected-minutes, news/social, or rival-manager archive | High | A leakage-safe expected-minutes ablation now exists; an importer for the public official bootstrap snapshot archive is validated, but the full context replay is not yet promoted |
 
 The two high-severity temporal issues were capable of making backtests look
 better or worse for the wrong reason. Results from before those fixes—such as
@@ -50,6 +50,12 @@ On the untouched 2025/26 replay across four legal opening squads:
 | Learned neural action policy | 2,076.25 | 2,156 | 257 |
 | Free-transfer anchor | 2,008.50 | 2,073 | 340 |
 | Anchored cocktail | 2,020.75 | 2,092 | 321 |
+
+The new expected-minutes ablation scored 2,064.75 mean and 2,155 best on the
+same untouched test. It still beat its paired anchor (2,031.50 mean), but it
+was below the prior clean point/horizon run (2,076.25 mean and 2,156 best), so
+it is retained as an inspectable feature family rather than promoted as a
+strategy improvement.
 
 This is evidence of a useful improvement over the anchor in this replay, not
 evidence of a winning FPL strategy. It is one held-out season with synthetic
@@ -78,8 +84,12 @@ better bookkeeping of the same limited context.
 ## Remediation order
 
 1. Preserve the current grain and leakage tests as regression tests.
-2. Add a timestamped context archive and a dedicated expected-minutes model.
-3. Add fixture-strength/matchup features using only pre-deadline information.
+2. Ingest the public timestamped official bootstrap snapshots for availability
+   and official-news replay, then add separate timestamped feeds for predicted
+   lineups, press conferences, and set-piece roles; the schema, importer, and
+   deadline cutoff are implemented in `docs/context-data-contract.md`.
+3. Calibrate the expected-minutes model against that context archive and add
+   fixture-strength/matchup features using only pre-deadline information.
 4. Add real rival-state replay where available, otherwise keep the synthetic
    league explicitly labeled as such.
 5. Re-run temporal folds and the untouched 2025/26 test only after the new

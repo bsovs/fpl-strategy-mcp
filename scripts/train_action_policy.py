@@ -30,6 +30,7 @@ from fpl_lab.player_models import (
     build_extended_player_feature_table,
     load_vaastav_gameweeks,
 )
+from fpl_lab.context import ContextStore, load_context_events
 from fpl_lab.policy import ActionValueEnsemble
 from fpl_lab.policy_training import (
     collect_counterfactual_examples,
@@ -60,6 +61,8 @@ def _forecast_caches(
     seasons: list[str],
     feature_frame: pd.DataFrame,
     forecast_model_kind: str = "neural",
+    context_store: ContextStore | None = None,
+    quality_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, dict[int, list]]:
     """Build a no-lookahead forecast cache for every requested season."""
 
@@ -70,7 +73,7 @@ def _forecast_caches(
         prior_seasons = [candidate for candidate in seasons if season_order(candidate) < season_order(season)]
         previous = season_data[prior_seasons[-1]] if prior_seasons else None
         if not prior_seasons:
-            caches[season] = build_signal_cache(current, previous)
+            caches[season] = build_signal_cache(current, previous, context_store=context_store)
             continue
         print(f"  fitting {forecast_model_kind} point/horizon/price models for {season}", flush=True)
         train = feature_frame[feature_frame["season"].isin(prior_seasons)].copy()
@@ -100,10 +103,61 @@ def _forecast_caches(
             )
         else:
             raise ValueError(f"unknown forecast_model_kind: {forecast_model_kind}")
+        # Availability is a separate supervised model rather than a proxy
+        # copied from the last five minutes.  It is trained on one row per
+        # player/gameweek, so a double gameweek contributes one aggregated
+        # outcome and cannot duplicate a player in the availability labels.
+        availability_train = gameweek_train.dropna(subset=["target_minutes_gw"])
+        expected_minutes_model = _fit_extended_ridge(
+            availability_train,
+            alpha=40.0,
+            target="target_minutes_gw",
+        )
+        short_minutes_model = _fit_extended_ridge(
+            gameweek_train.dropna(subset=["target_horizon_minutes_3"]),
+            alpha=40.0,
+            target="target_horizon_minutes_3",
+        )
+        long_minutes_model = _fit_extended_ridge(
+            gameweek_train.dropna(subset=["target_horizon_minutes_8"]),
+            alpha=40.0,
+            target="target_horizon_minutes_8",
+        )
         forecast_rows = target.copy()
         forecast_rows["extended_selected"] = forecast_model.predict(_extended_feature_columns(target))
         forecast_rows["forecast_short_expected_points"] = short_model.predict(_extended_feature_columns(target))
         forecast_rows["forecast_long_expected_points"] = long_model.predict(_extended_feature_columns(target))
+        forecast_rows["forecast_expected_minutes"] = np.clip(
+            expected_minutes_model.predict(_extended_feature_columns(target)), 0.0, 180.0
+        )
+        forecast_rows["forecast_short_expected_minutes"] = np.clip(
+            short_minutes_model.predict(_extended_feature_columns(target)), 0.0, 540.0
+        )
+        forecast_rows["forecast_long_expected_minutes"] = np.clip(
+            long_minutes_model.predict(_extended_feature_columns(target)), 0.0, 720.0
+        )
+        if quality_rows is not None:
+            target_gameweek = _distinct_player_gameweeks(target)
+            quality_specs = (
+                ("expected_minutes_gw", "target_minutes_gw", expected_minutes_model, 180.0),
+                ("expected_minutes_3gw", "target_horizon_minutes_3", short_minutes_model, 540.0),
+                ("expected_minutes_8gw", "target_horizon_minutes_8", long_minutes_model, 720.0),
+            )
+            target_features = _extended_feature_columns(target_gameweek)
+            for name, target_column, model, upper_bound in quality_specs:
+                actual = pd.to_numeric(target_gameweek[target_column], errors="coerce").to_numpy(float)
+                predicted = np.clip(model.predict(target_features), 0.0, upper_bound)
+                quality_rows.append(
+                    {
+                        "season": season,
+                        "target": name,
+                        "n": int(len(actual)),
+                        "rmse": float(np.sqrt(np.mean((actual - predicted) ** 2))),
+                        "mae": float(np.mean(np.abs(actual - predicted))),
+                        "actual_mean": float(np.mean(actual)),
+                        "predicted_mean": float(np.mean(predicted)),
+                    }
+                )
         price_train = gameweek_train.dropna(subset=["target_price_change"])
         if price_train.empty:
             forecast_rows["future_price_change_ridge"] = 0.0
@@ -256,6 +310,8 @@ def main() -> None:
     parser.add_argument("--training-chip-depth", type=int, default=5)
     parser.add_argument("--test-chip-depth", type=int, default=15)
     parser.add_argument("--forecast-model", choices=("neural", "ridge"), default="neural")
+    parser.add_argument("--news-context", action="append", default=[], help="backdated news JSON/JSONL/CSV; only events before each simulated deadline are used")
+    parser.add_argument("--social-context", action="append", default=[], help="backdated social JSON/JSONL/CSV; only events before each simulated deadline are used")
     parser.add_argument(
         "--starting-modes",
         nargs="+",
@@ -280,9 +336,25 @@ def main() -> None:
     print(f"Loading {len(seasons)} seasons", flush=True)
     raw = load_vaastav_gameweeks(history_root, seasons)
     print(f"Loaded {len(raw):,} rows; building temporal forecast caches", flush=True)
-    feature_frame = build_extended_player_feature_table(raw)
+    context_events = []
+    for path in args.news_context:
+        context_events.extend(load_context_events(path, kind="news"))
+    for path in args.social_context:
+        context_events.extend(load_context_events(path, kind="social"))
+    context_store = ContextStore(context_events) if context_events else None
+    if context_store is not None:
+        print(f"Loaded {len(context_events):,} backdated context events", flush=True)
+    feature_frame = build_extended_player_feature_table(raw, context_store=context_store)
     cache_seasons = development + [args.validation_season, args.evaluation_season]
-    caches = _forecast_caches(raw, cache_seasons, feature_frame, forecast_model_kind=args.forecast_model)
+    availability_quality: list[dict[str, Any]] = []
+    caches = _forecast_caches(
+        raw,
+        cache_seasons,
+        feature_frame,
+        forecast_model_kind=args.forecast_model,
+        context_store=context_store,
+        quality_rows=availability_quality,
+    )
     # Keep the action learner exposed to several legal opening families.  The
     # randomized family is seeded per mode so it is reproducible while still
     # testing whether a policy depends on one unusually favorable opening.
@@ -417,10 +489,13 @@ def main() -> None:
         "target_points": 2413,
         "feature_cache": (
             f"walk-forward extended {args.forecast_model} point forecasts, direct 3/8-gameweek forecasts, "
-            "and a next-gameweek price-change ridge; each season uses only prior seasons for fitting"
+            "a next-gameweek price-change ridge, and a separate expected-minutes ridge; "
+            "each season uses only prior seasons for fitting"
         ),
         "development_examples": len(development_examples),
         "validation_examples": len(validation_examples),
+        "context": context_store.summary() if context_store is not None else {"events": 0},
+        "availability_forecast_quality": availability_quality,
         "candidate_validation_scores": validation_scores,
         "selected_candidate": selected_name,
         "starting_squad_modes": list(starting_modes),

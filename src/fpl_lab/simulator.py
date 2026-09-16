@@ -311,6 +311,8 @@ def build_forecast_signals(
         news_risk = context_features.news_risk if context_features is not None else 0.0
         news_sentiment = context_features.news_sentiment if context_features is not None else 0.0
         social_sentiment = context_features.social_sentiment if context_features is not None else 0.0
+        set_piece_signal = context_features.set_piece_delta if context_features is not None else 0.0
+        transfer_role_signal = context_features.transfer_role_delta if context_features is not None else 0.0
         context_reliability = context_features.reliability if context_features is not None else 0.0
         context_event_count = context_features.event_count if context_features is not None else 0
         role_security = float(np.clip(minutes_probability, 0.0, 1.0))
@@ -356,6 +358,8 @@ def build_forecast_signals(
                 "news_risk": news_risk,
                 "news_sentiment": news_sentiment,
                 "social_sentiment": social_sentiment,
+                "set_piece_signal": set_piece_signal,
+                "transfer_role_signal": transfer_role_signal,
                 "context_reliability": context_reliability,
                 "context_event_count": context_event_count,
                 "trigger": "Reassess after the next deadline",
@@ -446,23 +450,29 @@ def build_model_signal_cache(
     # value and can change wildcard/Free Hit rankings.
     if frame.duplicated(["gameweek", "player_id"]).any():
         point_totals = frame.groupby(["gameweek", "player_id"], as_index=False)["extended_selected"].sum()
-        horizon_columns = [
+        mean_columns = [
             column
-            for column in ("forecast_short_expected_points", "forecast_long_expected_points")
+            for column in (
+                "forecast_short_expected_points",
+                "forecast_long_expected_points",
+                "forecast_expected_minutes",
+                "forecast_short_expected_minutes",
+                "forecast_long_expected_minutes",
+            )
             if column in frame
         ]
-        horizon_totals = (
-            frame.groupby(["gameweek", "player_id"], as_index=False)[horizon_columns].mean()
-            if horizon_columns
+        mean_totals = (
+            frame.groupby(["gameweek", "player_id"], as_index=False)[mean_columns].mean()
+            if mean_columns
             else None
         )
         frame = frame.drop_duplicates(["gameweek", "player_id"], keep="last").drop(
             columns=["extended_selected"]
         )
         frame = frame.merge(point_totals, on=["gameweek", "player_id"], how="left", validate="one_to_one")
-        if horizon_totals is not None:
-            frame = frame.drop(columns=horizon_columns).merge(
-                horizon_totals,
+        if mean_totals is not None:
+            frame = frame.drop(columns=mean_columns).merge(
+                mean_totals,
                 on=["gameweek", "player_id"],
                 how="left",
                 validate="one_to_one",
@@ -487,9 +497,21 @@ def build_model_signal_cache(
             minutes_share = float(getattr(row, "minutes_share_5", 0.0) or 0.0)
             form_acceleration = float(getattr(row, "form_acceleration", 0.0) or 0.0)
             news_risk = float(getattr(row, "news_risk", 0.0) or 0.0)
+            news_sentiment = float(getattr(row, "news_sentiment", 0.0) or 0.0)
             social_sentiment = float(getattr(row, "social_sentiment", 0.0) or 0.0)
+            set_piece_signal = float(getattr(row, "context_set_piece_delta", 0.0) or 0.0)
+            transfer_role_signal = float(getattr(row, "context_transfer_role_delta", 0.0) or 0.0)
             short_fixtures = float(getattr(row, "fixtures_next_3", short_horizon) or short_horizon)
             long_fixtures = float(getattr(row, "fixtures_next_5", long_horizon) or long_horizon)
+            current_fixtures = max(1.0, float(getattr(row, "fixtures_current_gw", 1.0) or 1.0))
+            short_fixture_count = max(
+                1.0,
+                current_fixtures + float(getattr(row, "fixtures_next_2", max(0.0, short_fixtures - 1.0)) or 0.0),
+            )
+            long_fixture_count = max(
+                1.0,
+                current_fixtures + float(getattr(row, "fixtures_next_7", max(0.0, long_fixtures - 1.0)) or 0.0),
+            )
             direct_short = getattr(row, "forecast_short_expected_points", None)
             direct_long = getattr(row, "forecast_long_expected_points", None)
             if direct_short is not None and pd.notna(direct_short):
@@ -500,25 +522,50 @@ def build_model_signal_cache(
                 long_points = max(0.0, float(direct_long))
             else:
                 long_points = next_points * max(1.0, min(float(long_horizon), long_fixtures))
+            historical_minutes = max(0.0, minutes_share * 90.0 * current_fixtures)
+            expected_minutes = getattr(row, "forecast_expected_minutes", None)
+            short_expected_minutes = getattr(row, "forecast_short_expected_minutes", None)
+            long_expected_minutes = getattr(row, "forecast_long_expected_minutes", None)
+            current_minutes = (
+                max(0.0, float(expected_minutes))
+                if expected_minutes is not None and pd.notna(expected_minutes)
+                else historical_minutes
+            )
+            short_minutes = (
+                max(0.0, float(short_expected_minutes))
+                if short_expected_minutes is not None and pd.notna(short_expected_minutes)
+                else current_minutes + minutes_share * 90.0 * max(0.0, short_fixture_count - current_fixtures)
+            )
+            long_minutes = (
+                max(0.0, float(long_expected_minutes))
+                if long_expected_minutes is not None and pd.notna(long_expected_minutes)
+                else current_minutes + minutes_share * 90.0 * max(0.0, long_fixture_count - current_fixtures)
+            )
+            short_minutes_probability = float(np.clip(short_minutes / (90.0 * short_fixture_count), 0.0, 1.0))
+            long_minutes_probability = float(np.clip(long_minutes / (90.0 * long_fixture_count), 0.0, 1.0))
+            current_minutes_probability = float(np.clip(current_minutes / (90.0 * current_fixtures), 0.0, 1.0))
             signals.append(
                 PlayerSignal(
                     player_id=player_id,
                     short_expected_points=short_points,
                     long_expected_points=long_points,
                     next_expected_points=next_points,
-                    short_minutes_probability=float(np.clip(minutes_share, 0.0, 1.0)),
-                    long_minutes_probability=float(np.clip(minutes_share, 0.0, 1.0)),
+                    short_minutes_probability=short_minutes_probability,
+                    long_minutes_probability=long_minutes_probability,
                     form_signal=float(np.clip(form_acceleration / 3.0, -1.0, 1.0)),
-                    role_security=float(np.clip(minutes_share, 0.0, 1.0)),
-                    injury_risk=float(np.clip(1.0 - minutes_share, 0.0, 1.0)),
-                    rotation_risk=float(np.clip(0.5 * (1.0 - minutes_share), 0.0, 1.0)),
+                    role_security=current_minutes_probability,
+                    injury_risk=float(np.clip(1.0 - current_minutes_probability, 0.0, 1.0)),
+                    rotation_risk=float(np.clip(0.5 * (1.0 - current_minutes_probability), 0.0, 1.0)),
                     price_change_risk=float(np.clip(abs(price_change) / 2.0, 0.0, 1.0)),
                     uncertainty=float(np.clip(1.0 / max(1.0, np.sqrt(5.0)), 0.0, 1.0)),
                     captain_upside=float(np.clip(next_points / 8.0, 0.0, 1.0)),
                     short_price_signal=float(np.clip(price_change / 2.0, -1.0, 1.0)),
                     long_price_signal=float(np.clip(price_change / 2.0, -1.0, 1.0)),
                     news_risk=float(np.clip(news_risk, 0.0, 1.0)),
+                    news_sentiment=float(np.clip(news_sentiment, -1.0, 1.0)),
                     social_sentiment=float(np.clip(social_sentiment, -1.0, 1.0)),
+                    set_piece_signal=float(np.clip(set_piece_signal, -1.0, 1.0)),
+                    transfer_role_signal=float(np.clip(transfer_role_signal, -1.0, 1.0)),
                     trigger="extended historical forecast",
                     note="forecast layer bridged into the legal simulator; news/social are zero without timestamped context",
                 )

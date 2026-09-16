@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from fpl_lab.player_models import load_vaastav_gameweeks, run_extended_player_benchmark
+from fpl_lab.context import ContextStore, load_context_events
 
 
 def season_order(season: str) -> int:
@@ -31,6 +32,8 @@ def main() -> None:
     parser.add_argument("--evaluation-season", default="2025-26", help="untouched final test season")
     parser.add_argument("--validation-season", default="2024-25", help="development-only model selection season")
     parser.add_argument("--output-dir", default="runs/player-models", help="directory for metrics, predictions and models")
+    parser.add_argument("--news-context", action="append", default=[], help="backdated news JSON/JSONL/CSV")
+    parser.add_argument("--social-context", action="append", default=[], help="backdated social JSON/JSONL/CSV")
     args = parser.parse_args()
 
     history_root = Path(args.history_root)
@@ -51,11 +54,20 @@ def main() -> None:
     print(f"Loading {len(seasons)} seasons: {', '.join(seasons)}", flush=True)
     raw = load_vaastav_gameweeks(history_root, seasons)
     print(f"Loaded {len(raw):,} raw player-fixture rows", flush=True)
+    context_events = []
+    for path in args.news_context:
+        context_events.extend(load_context_events(path, kind="news"))
+    for path in args.social_context:
+        context_events.extend(load_context_events(path, kind="social"))
+    context_store = ContextStore(context_events) if context_events else None
+    if context_store is not None:
+        print(f"Loaded {len(context_events):,} backdated context events", flush=True)
     result = run_extended_player_benchmark(
         raw,
         development_seasons=development,
         validation_season=args.validation_season,
         evaluation_season=args.evaluation_season,
+        context_store=context_store,
     )
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -106,6 +118,7 @@ def main() -> None:
         "validation_season": args.validation_season,
         "evaluation_season": args.evaluation_season,
         "feature_count_used_by_model": result.metadata["feature_count"],
+        "context": context_store.summary() if context_store is not None else {"events": 0},
     }
     (output_dir / "data-audit.json").write_text(json.dumps(audit, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps({"output_dir": str(output_dir), "selected_model": result.metadata["selected_model"], "metrics": {key: result.metrics[key] for key in ("last5", "ewma5", "extended_selected", "future_price_change_ridge")}}, indent=2))
