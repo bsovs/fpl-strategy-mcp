@@ -19,10 +19,11 @@ $env:FPL_STRATEGY_CLIENTS="all"; irm https://raw.githubusercontent.com/bsovs/fpl
 ```
 
 The installers download the latest release binary, register it with the selected
-clients, and run a health check. Use `--clients claude`, `--clients codex`, or
-`--clients none` to narrow the setup. Existing Claude JSON is backed up before
-it is changed. Each GitHub release also publishes SHA-256 checksums. To pin a
-version, set `FPL_STRATEGY_VERSION=0.1.3` before running the installer.
+clients, and run a fast health check. Use `--clients claude`,
+`--clients claude-code`, `--clients codex`, or `--clients none` to narrow the
+setup. Existing Claude JSON and Codex TOML are backed up before they are
+changed. Each GitHub release also publishes SHA-256 checksums. To pin a
+version, set `FPL_STRATEGY_VERSION=0.1.4` before running the installer.
 
 ## Connect a client
 
@@ -38,7 +39,11 @@ clean. To inspect the installation later:
 ```sh
 fpl-strategy-mcp status
 fpl-strategy-mcp status --json
+fpl-strategy-mcp status --deep
 ```
+
+The default status check is fast and only verifies installed assets and client
+configuration. `--deep` additionally loads the bundled model.
 
 To register an already-installed binary:
 

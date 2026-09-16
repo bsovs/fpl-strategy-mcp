@@ -18,9 +18,10 @@ $env:FPL_STRATEGY_CLIENTS="all"; irm https://raw.githubusercontent.com/bsovs/fpl
 ```
 
 The installer downloads the matching release binary, configures the selected
-clients, backs up an existing Claude Desktop config, and runs
+clients, backs up existing Claude/Codex config, and runs a fast
 `fpl-strategy-mcp status`. To configure an existing installation later, run
-`fpl-strategy-mcp setup --clients all`.
+`fpl-strategy-mcp setup --clients all`. Use `fpl-strategy-mcp status --deep`
+when you want to load-test the bundled model.
 
 ## Claude Desktop and Claude Code
 

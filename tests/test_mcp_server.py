@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from fpl_strategy_mcp.server import (
     _configure_claude_desktop,
+    _configure_codex_config,
     _dispatch,
     _load_model,
     _parse_clients,
@@ -46,6 +47,22 @@ class MCPServerTests(unittest.TestCase):
     def test_client_aliases(self):
         self.assertEqual(_parse_clients("all"), {"claude", "codex"})
         self.assertEqual(_parse_clients("claude-desktop,codex"), {"claude", "codex"})
+
+    def test_setup_writes_codex_toml_and_replaces_old_entry(self):
+        with TemporaryDirectory() as directory:
+            config = Path(directory) / "config.toml"
+            config.write_text(
+                '[mcp_servers.other]\ncommand = "other"\n\n'
+                '[mcp_servers.fpl-strategy]\ncommand = "old"\n',
+                encoding="utf-8",
+            )
+            with patch("fpl_strategy_mcp.server._codex_config_path", return_value=config):
+                result = _configure_codex_config(["/tmp/fpl-strategy-mcp"])
+            self.assertEqual(result["status"], "configured")
+            content = config.read_text(encoding="utf-8")
+            self.assertIn('[mcp_servers.other]', content)
+            self.assertIn('command = "/tmp/fpl-strategy-mcp"', content)
+            self.assertNotIn('command = "old"', content)
 
 
 if __name__ == "__main__":

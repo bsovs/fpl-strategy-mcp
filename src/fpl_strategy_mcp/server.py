@@ -23,13 +23,12 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import sys
 import subprocess
 import time
 from typing import Any
-
-import joblib
 
 if os.environ.get("FPL_STRATEGY_HOME"):
     ROOT = Path(os.environ["FPL_STRATEGY_HOME"]).expanduser().resolve()
@@ -41,16 +40,8 @@ SOURCE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SOURCE_ROOT))
 sys.path.insert(0, str(ROOT))
 
-from fpl_lab.decision import DecisionConfig, PlayerSignal, PlayerState
-from fpl_lab.fpl_api import BOOTSTRAP_URL, fetch_json
-from fpl_lab.live_strategy import recommend_live_moves
-from fpl_lab.league import HYBRID_PROFILES
-from fpl_lab.policy import ActionValueEnsemble, ActionValueMLP
-from fpl_lab.simulator import CHIP_KINDS
-
-
 SERVER_NAME = "fpl-strategy"
-SERVER_VERSION = "0.1.3"
+SERVER_VERSION = "0.1.4"
 PROTOCOL_VERSION = "2024-11-05"
 PACKAGE_ASSETS = Path(__file__).resolve().parent / "assets"
 DEFAULT_MODEL = ROOT / "assets" / "action-policy-model.joblib"
@@ -96,6 +87,11 @@ def _claude_desktop_config_path() -> Path:
     return Path(config_home) / "Claude" / "claude_desktop_config.json"
 
 
+def _codex_config_path() -> Path:
+    codex_home = os.environ.get("CODEX_HOME") or str(Path.home() / ".codex")
+    return Path(codex_home) / "config.toml"
+
+
 def _backup_file(path: Path) -> str | None:
     if not path.exists():
         return None
@@ -104,13 +100,17 @@ def _backup_file(path: Path) -> str | None:
     return str(backup)
 
 
-def _write_json_file(path: Path, payload: dict[str, Any]) -> str | None:
+def _write_text_file(path: Path, text: str) -> str | None:
     path.parent.mkdir(parents=True, exist_ok=True)
     backup = _backup_file(path)
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    temporary.write_text(text, encoding="utf-8")
     os.replace(temporary, path)
     return backup
+
+
+def _write_json_file(path: Path, payload: dict[str, Any]) -> str | None:
+    return _write_text_file(path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
 
 
 def _configure_claude_desktop(command: list[str]) -> dict[str, Any]:
@@ -132,6 +132,46 @@ def _configure_claude_desktop(command: list[str]) -> dict[str, Any]:
     return {"status": "configured", "path": str(path), "backup": backup, "entry": entry}
 
 
+def _toml_has_server(path: Path) -> bool:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return bool(re.search(r"(?m)^\[mcp_servers\.fpl-strategy(?:\.[^\]]+)?\]\s*$", text))
+
+
+def _configure_codex_config(command: list[str]) -> dict[str, Any]:
+    """Register the stdio server without requiring the Codex CLI executable."""
+
+    path = _codex_config_path()
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    lines = text.splitlines(keepends=True)
+    kept: list[str] = []
+    skipping = False
+    for line in lines:
+        match = re.match(r"^\s*\[([^\]]+)\]\s*$", line)
+        if match:
+            skipping = match.group(1) == "mcp_servers.fpl-strategy" or match.group(1).startswith("mcp_servers.fpl-strategy.")
+        if not skipping:
+            kept.append(line)
+    cleaned = "".join(kept).rstrip() + ("\n\n" if kept else "")
+    command_literal = json.dumps(command[0], ensure_ascii=False)
+    args_literal = json.dumps(command[1:], ensure_ascii=False)
+    updated = (
+        cleaned
+        + "[mcp_servers.fpl-strategy]\n"
+        + f"command = {command_literal}\nargs = {args_literal}\nstartup_timeout_sec = 120\n"
+    )
+    backup = _write_text_file(path, updated)
+    return {
+        "status": "configured",
+        "client": "codex",
+        "path": str(path),
+        "backup": backup,
+        "entry": {"command": command[0], "args": command[1:], "startup_timeout_sec": 120},
+    }
+
+
 def _replace_cli_mcp_server(cli_name: str, command: list[str]) -> dict[str, Any]:
     executable = shutil.which(cli_name)
     if not executable:
@@ -139,6 +179,7 @@ def _replace_cli_mcp_server(cli_name: str, command: list[str]) -> dict[str, Any]
     remove = subprocess.run(
         [executable, "mcp", "remove", SERVER_NAME],
         capture_output=True,
+        stdin=subprocess.DEVNULL,
         text=True,
         timeout=10,
         check=False,
@@ -146,6 +187,7 @@ def _replace_cli_mcp_server(cli_name: str, command: list[str]) -> dict[str, Any]
     add = subprocess.run(
         [executable, "mcp", "add", SERVER_NAME, "--", *command],
         capture_output=True,
+        stdin=subprocess.DEVNULL,
         text=True,
         timeout=20,
         check=False,
@@ -170,12 +212,11 @@ def _parse_clients(value: str) -> set[str]:
         requested.discard("all")
     aliases = {
         "claude-desktop": "claude",
-        "claude-code": "claude",
     }
     requested = {aliases.get(item, item) for item in requested}
-    unknown = requested - {"claude", "codex"}
+    unknown = requested - {"claude", "claude-code", "codex"}
     if unknown:
-        raise ValueError(f"unknown client(s): {sorted(unknown)}; use claude, codex, or all")
+        raise ValueError(f"unknown client(s): {sorted(unknown)}; use claude, claude-code, codex, or all")
     return requested
 
 
@@ -184,10 +225,16 @@ def _setup_clients(value: str) -> dict[str, Any]:
     clients = _parse_clients(value)
     results: dict[str, Any] = {"command": command, "requested": sorted(clients)}
     if "claude" in clients:
+        print("Configuring Claude Desktop...", file=sys.stderr, flush=True)
         results["claude_desktop"] = _configure_claude_desktop(command)
+    if "claude-code" in clients:
+        print("Configuring Claude Code CLI...", file=sys.stderr, flush=True)
         results["claude_code"] = _replace_cli_mcp_server("claude", command)
     if "codex" in clients:
-        results["codex"] = _replace_cli_mcp_server("codex", command)
+        print("Configuring Codex...", file=sys.stderr, flush=True)
+        # The same config is consumed by the Codex desktop app and CLI. Write
+        # it directly so desktop-only users do not need a second executable.
+        results["codex"] = _configure_codex_config(command)
     return results
 
 
@@ -197,6 +244,25 @@ def _config_has_server(path: Path) -> bool:
         return isinstance(payload, dict) and SERVER_NAME in (payload.get("mcpServers") or {})
     except (OSError, ValueError, TypeError):
         return False
+
+
+def _json_contains_server(value: Any) -> bool:
+    if isinstance(value, dict):
+        servers = value.get("mcpServers")
+        if isinstance(servers, dict) and SERVER_NAME in servers:
+            return True
+        return any(_json_contains_server(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_json_contains_server(item) for item in value)
+    return False
+
+
+def _json_config_has_server(path: Path) -> bool:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    return _json_contains_server(payload)
 
 
 def _cli_status(cli_name: str) -> dict[str, Any]:
@@ -216,17 +282,26 @@ def _cli_status(cli_name: str) -> dict[str, Any]:
     return {"available": True, "configured": result.returncode == 0}
 
 
-def _status_payload() -> dict[str, Any]:
-    model, model_path, model_error = _load_model()
+def _status_payload(deep: bool = False) -> dict[str, Any]:
     bootstrap_path = _asset_path("bootstrap-static.snapshot.json")
+    model_asset_path = _asset_path("action-policy-model.joblib")
+    model = None
+    model_path = str(model_asset_path.resolve())
+    model_error = None
+    if deep:
+        model, model_path, model_error = _load_model()
     claude_path = _claude_desktop_config_path()
+    claude_code_path = Path.home() / ".claude.json"
+    codex_path = _codex_config_path()
     return {
-        "status": "ready" if model is not None and bootstrap_path.exists() else "degraded",
+        "status": "ready" if model_asset_path.exists() and bootstrap_path.exists() and (not deep or model is not None) else "degraded",
         "server": SERVER_NAME,
         "version": SERVER_VERSION,
         "default_transport": "stdio",
         "protocol_version": PROTOCOL_VERSION,
-        "model_loaded": model is not None,
+        "model_present": model_asset_path.exists(),
+        "model_checked": deep,
+        "model_loaded": model is not None if deep else None,
         "model_path": model_path,
         "model_error": model_error,
         "bootstrap_snapshot": str(bootstrap_path),
@@ -236,8 +311,16 @@ def _status_payload() -> dict[str, Any]:
                 "configured": _config_has_server(claude_path),
                 "config_path": str(claude_path),
             },
-            "claude_code_cli": _cli_status("claude"),
-            "codex_cli": _cli_status("codex"),
+            "claude_code_cli": {
+                "available": shutil.which("claude") is not None,
+                "configured": _json_config_has_server(claude_code_path),
+                "config_path": str(claude_code_path),
+            },
+            "codex_cli": {
+                "available": shutil.which("codex") is not None,
+                "configured": _toml_has_server(codex_path),
+                "config_path": str(codex_path),
+            },
         },
     }
 
@@ -245,7 +328,10 @@ def _status_payload() -> dict[str, Any]:
 def _print_status(payload: dict[str, Any]) -> None:
     print(f"FPL Strategy MCP {payload['version']}")
     print(f"Status: {str(payload['status']).upper()}")
-    print(f"Model: {'loaded' if payload['model_loaded'] else 'not loaded'}")
+    if payload["model_checked"]:
+        print(f"Model: {'loaded' if payload['model_loaded'] else 'not loaded'}")
+    else:
+        print(f"Model asset: {'present' if payload['model_present'] else 'missing'} (not loaded; use --deep to verify)")
     print(f"Bootstrap snapshot: {'present' if payload['bootstrap_present'] else 'missing'}")
     clients = payload["clients"]
     claude = clients["claude_desktop"]
@@ -282,6 +368,10 @@ def _json(value: Any) -> str:
 
 
 def _load_model(path_value: str | None = None):
+    import joblib
+
+    from fpl_lab.policy import ActionValueEnsemble, ActionValueMLP
+
     raw = path_value or os.environ.get("FPL_NEURAL_MODEL") or str(_asset_path("action-policy-model.joblib"))
     path = Path(raw)
     if not path.is_absolute():
@@ -330,6 +420,8 @@ def _clip(value: float, low: float, high: float) -> float:
 
 def _load_bootstrap(path_value: str | None, fetch_official: bool) -> tuple[dict[str, Any], str]:
     """Load a local snapshot by default, or fetch the official API explicitly."""
+
+    from fpl_lab.fpl_api import BOOTSTRAP_URL, fetch_json
 
     if fetch_official:
         return fetch_json(BOOTSTRAP_URL), BOOTSTRAP_URL
@@ -393,6 +485,8 @@ def _official_signal_rows(
 ) -> list[PlayerSignal]:
     """Build a transparent, explicitly weaker signal fallback from bootstrap fields."""
 
+    from fpl_lab.decision import PlayerSignal
+
     signals: list[PlayerSignal] = []
     remaining = max(1, 38 - int(gameweek) + 1)
     long_window = min(8, remaining)
@@ -449,6 +543,9 @@ def _official_signal_rows(
 
 
 def _state_from_arguments(arguments: dict[str, Any]):
+    from fpl_lab.decision import DecisionConfig, PlayerState
+    from fpl_lab.simulator import CHIP_KINDS
+
     payload = arguments.get("state", arguments)
     if not isinstance(payload, dict):
         raise ValueError("state must be an object")
@@ -540,6 +637,8 @@ def _state_from_arguments(arguments: dict[str, Any]):
 
 
 def _recommend(arguments: dict[str, Any]) -> dict[str, Any]:
+    from fpl_lab.live_strategy import recommend_live_moves
+
     state = _state_from_arguments(arguments)
     model, model_path, model_error = _load_model(state["model_path"])
     result = recommend_live_moves(
@@ -572,6 +671,8 @@ def _recommend(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 def _strategy_info() -> dict[str, Any]:
+    from fpl_lab.league import HYBRID_PROFILES
+
     metrics_path = _asset_path("league-benchmark.json")
     league = json.loads(metrics_path.read_text(encoding="utf-8")) if metrics_path.exists() else {}
     selected = league.get("development_best_hybrid", {})
@@ -786,16 +887,21 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--clients",
         default=os.environ.get("FPL_STRATEGY_CLIENTS", "all"),
-        help="comma-separated clients for setup: claude, codex, or all",
+        help="comma-separated clients for setup: claude, claude-code, codex, or all",
     )
     parser.add_argument("--json", action="store_true", help="print status/setup output as JSON")
+    parser.add_argument("--deep", action="store_true", help="load and validate the bundled model during status")
     parser.add_argument("--quiet", action="store_true", help="suppress the stdio readiness line")
     args = parser.parse_args(argv)
     if args.command == "version":
         print(SERVER_VERSION)
         return
     if args.command == "status":
-        payload = _status_payload()
+        if args.deep:
+            print("Checking bundled model, data snapshot, and client configuration...", file=sys.stderr, flush=True)
+        else:
+            print("Checking installed assets and client configuration...", file=sys.stderr, flush=True)
+        payload = _status_payload(deep=args.deep)
         if args.json:
             print(json.dumps(payload, indent=2, ensure_ascii=False))
         else:
@@ -805,6 +911,7 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command == "setup":
         try:
+            print("Starting MCP client setup...", file=sys.stderr, flush=True)
             payload = _setup_clients(args.clients)
         except Exception as exc:
             if args.json:

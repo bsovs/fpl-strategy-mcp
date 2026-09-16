@@ -79,6 +79,7 @@ if [ "$clients" != "none" ] && [ -n "$clients" ]; then
   "$install_dir/fpl-strategy-mcp" setup --clients "$clients"
 fi
 
+echo "Running fast health check (use 'fpl-strategy-mcp status --deep' for a full model load test)..."
 "$install_dir/fpl-strategy-mcp" status
 
 case ":${PATH}:" in

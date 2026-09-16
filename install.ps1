@@ -32,5 +32,6 @@ if ($clients -and $clients -ne "none") {
     if ($LASTEXITCODE -ne 0) { throw "MCP client setup failed" }
 }
 
+Write-Host "Running fast health check (use 'fpl-strategy-mcp status --deep' for a full model load test)..."
 & $destination status
 if ($LASTEXITCODE -ne 0) { throw "Installed binary health check failed" }
