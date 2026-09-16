@@ -24,6 +24,7 @@ from .server import (
     SERVER_NAME,
     _backtest_strategy,
     _forecast_signals,
+    _lineup_plan,
     _recommend,
     _score_moves,
     _search_players,
@@ -78,6 +79,32 @@ def fpl_recommend_moves(
     # The stdio handler treats an omitted key differently from an explicit
     # null for a few optional values, so remove nulls before dispatching.
     return _recommend({key: value for key, value in payload.items() if value is not None})
+
+
+@mcp.tool()
+def fpl_lineup_plan(
+    gameweek: int,
+    current_squad: list[dict[str, Any]],
+    buyable_players: list[dict[str, Any]] | None = None,
+    signals: list[dict[str, Any]] | None = None,
+    auto_official_signals: bool = True,
+    bootstrap_path: str | None = None,
+    fetch_official: bool = False,
+) -> dict[str, Any]:
+    """Return the legal live formation, XI, bench and captaincy plan."""
+
+    payload: dict[str, Any] = {
+        "gameweek": gameweek,
+        "current_squad": current_squad,
+        "auto_official_signals": auto_official_signals,
+        "bootstrap_path": bootstrap_path,
+        "fetch_official": fetch_official,
+    }
+    if buyable_players is not None:
+        payload["buyable_players"] = buyable_players
+    if signals is not None:
+        payload["signals"] = signals
+    return _lineup_plan({key: value for key, value in payload.items() if value is not None})
 
 
 @mcp.tool()

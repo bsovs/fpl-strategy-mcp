@@ -28,6 +28,7 @@ class MCPServerTests(unittest.TestCase):
             names,
             {
                 "fpl_recommend_moves",
+                "fpl_lineup_plan",
                 "fpl_search_players",
                 "fpl_forecast_signals",
                 "fpl_score_moves",
@@ -88,6 +89,41 @@ class MCPServerTests(unittest.TestCase):
         self.assertIn("short_weight", catalog["tunable_fields"])
         self.assertIn("hybrid_win", catalog["strategies"])
         self.assertIn("model_weight", catalog["default_cocktail_config"])
+
+    def test_live_lineup_optimizer_respects_shape_and_bench_boost(self):
+        from fpl_lab.decision import PlayerSignal, PlayerState
+        from fpl_lab.live_strategy import choose_live_lineup
+
+        positions = ["GKP", "GKP", *("DEF",) * 5, *("MID",) * 5, *("FWD",) * 3]
+        expected = [5.0, 1.0, 6.0, 5.0, 4.0, 3.0, 2.0, 8.0, 7.0, 6.0, 5.0, 4.0, 9.0, 8.5, 1.0]
+        squad = [
+            PlayerState(
+                player_id=f"p{index}",
+                name=f"Player {index}",
+                position=position,
+                team="A",
+                price=5.0,
+            )
+            for index, position in enumerate(positions)
+        ]
+        signals = [
+            PlayerSignal(
+                player_id=player.player_id,
+                short_expected_points=points,
+                long_expected_points=points * 8.0,
+                next_expected_points=points,
+            )
+            for player, points in zip(squad, expected)
+        ]
+
+        plan = choose_live_lineup(squad, signals)
+        self.assertEqual(plan["formation"], "3-5-2")
+        self.assertEqual(len(plan["starting_xi"]), 11)
+        self.assertEqual(len(plan["bench_order"]), 4)
+        self.assertEqual(plan["captain"]["player_id"], "p12")
+        self.assertEqual(plan["vice_captain"]["player_id"], "p13")
+        self.assertEqual(plan["bench_boost_increment"], 7.0)
+        self.assertIn("Only the starting XI scores normally", plan["note"])
 
     def test_scenario_backtest_compares_weight_candidates(self):
         from fpl_strategy_mcp.server import _backtest_strategy

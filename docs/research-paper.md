@@ -170,8 +170,9 @@ timing rather than merely adding a static value score.
    not causal evidence that a real manager could have captured the same result.
 3. Forecast quality is still constrained by public FPL data, missing or
    imperfect expected-minutes information, and changing game rules.
-4. The live Bench Boost path uses a proxy lineup when historical fixtures are
-   unavailable; historical backtests use the exact legal lineup.
+4. The live lineup path uses the legal formation optimizer over the supplied
+   forecast signals; final autosubs remain dependent on confirmed minutes and
+   late team news.
 5. News and social fields are supported by the schema but are not a validated,
    continuously ingested production feature set in this release.
 6. “Going for the win” needs a real league-state distribution and rival-action
@@ -215,4 +216,3 @@ environment lock, and all walk-forward predictions alongside the binary.
 - [Open FPL solver](https://github.com/solioanalytics/open-fpl-solver)
 - [MCP Python SDK: connecting a server to a host](https://py.sdk.modelcontextprotocol.io/get-started/real-host/)
 - [OpenAI Responses API remote MCP tools](https://developers.openai.com/api/reference/cli/resources/beta/subresources/responses)
-

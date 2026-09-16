@@ -28,6 +28,150 @@ from .simulator import CHIP_KINDS, recommendation_to_policy_action
 
 NEURAL_TYPES = (ActionValueMLP, ActionValueEnsemble)
 
+# FPL permits these eight outfield shapes for a legal starting XI. The live
+# adapter uses forecast points to choose both the shape and the players inside
+# it; this is deliberately separate from transfer selection because a transfer
+# can be good for the squad while still leaving a different player on the bench
+# this week.
+LIVE_FORMATIONS = (
+    ("3-4-3", 3, 4, 3),
+    ("3-5-2", 3, 5, 2),
+    ("4-3-3", 4, 3, 3),
+    ("4-4-2", 4, 4, 2),
+    ("4-5-1", 4, 5, 1),
+    ("5-2-3", 5, 2, 3),
+    ("5-3-2", 5, 3, 2),
+    ("5-4-1", 5, 4, 1),
+)
+
+
+def _lineup_position(player: PlayerState) -> str:
+    """Normalize the API's GKP label to the simulator's GK label."""
+
+    position = str(player.position).upper()
+    return "GK" if position in {"GK", "GKP"} else position
+
+
+def _live_expected_points(signal: PlayerSignal) -> float:
+    """Return the one-GW forecast used for lineup selection."""
+
+    return float(signal.next_expected_points or signal.short_expected_points)
+
+
+def _lineup_player_row(player: PlayerState, signal: PlayerSignal) -> dict[str, Any]:
+    return {
+        "player_id": player.player_id,
+        "name": player.name,
+        "position": "GKP" if _lineup_position(player) == "GK" else _lineup_position(player),
+        "team": player.team,
+        "price": float(player.price),
+        "expected_points": round(_live_expected_points(signal), 3),
+        "minutes_probability": round(float(signal.short_minutes_probability), 3),
+        "news_risk": round(float(signal.news_risk), 3),
+    }
+
+
+def choose_live_lineup(
+    current_squad: Iterable[PlayerState],
+    signals: Iterable[PlayerSignal],
+) -> dict[str, Any]:
+    """Choose the exact legal live XI, bench order, shape and captaincy.
+
+    This is an optimizer over the legal FPL formations, not a four-player
+    bench approximation. It uses the point-in-time forecast supplied to the
+    MCP; realized minutes and autosubs remain a historical-simulation concern.
+    """
+
+    squad = list(current_squad)
+    if len(squad) != 15:
+        raise ValueError(f"current_squad must contain exactly 15 players; received {len(squad)}")
+    signal_by_id = {signal.player_id: signal for signal in signals}
+    missing = sorted({player.player_id for player in squad} - set(signal_by_id))
+    if missing:
+        raise ValueError(f"missing signals for lineup player IDs: {missing[:10]}")
+    players_by_position: dict[str, list[PlayerState]] = {"GK": [], "DEF": [], "MID": [], "FWD": []}
+    for player in squad:
+        position = _lineup_position(player)
+        if position not in players_by_position:
+            raise ValueError(f"unsupported lineup position {player.position!r} for {player.player_id}")
+        players_by_position[position].append(player)
+
+    def sort_key(player: PlayerState) -> tuple[float, float, float]:
+        signal = signal_by_id[player.player_id]
+        return (
+            _live_expected_points(signal),
+            float(signal.short_minutes_probability),
+            float(signal.captain_upside),
+        )
+
+    best: dict[str, Any] | None = None
+    for formation, defender_count, midfielder_count, forward_count in LIVE_FORMATIONS:
+        counts = {
+            "GK": 1,
+            "DEF": defender_count,
+            "MID": midfielder_count,
+            "FWD": forward_count,
+        }
+        if any(len(players_by_position[position]) < count for position, count in counts.items()):
+            continue
+        starting_players: list[PlayerState] = []
+        for position, count in counts.items():
+            starting_players.extend(sorted(players_by_position[position], key=sort_key, reverse=True)[:count])
+        starting_ids = {player.player_id for player in starting_players}
+        bench_players = [player for player in squad if player.player_id not in starting_ids]
+        bench_goalkeepers = [player for player in bench_players if _lineup_position(player) == "GK"]
+        bench_outfield = [player for player in bench_players if _lineup_position(player) != "GK"]
+        bench_order = bench_goalkeepers[:1] + sorted(bench_outfield, key=sort_key, reverse=True)
+        starting_sorted = sorted(starting_players, key=sort_key, reverse=True)
+        captain = starting_sorted[0]
+        vice_captain = starting_sorted[1]
+        base_points = sum(_live_expected_points(signal_by_id[player.player_id]) for player in starting_players)
+        captain_bonus = _live_expected_points(signal_by_id[captain.player_id])
+        projected_total = base_points + captain_bonus
+        bench_points = sum(_live_expected_points(signal_by_id[player.player_id]) for player in bench_players)
+        candidate = {
+            "formation": formation,
+            "starting_players": starting_players,
+            "bench_players": bench_players,
+            "bench_order_players": bench_order,
+            "captain_player": captain,
+            "vice_captain_player": vice_captain,
+            "projected_start_points": base_points,
+            "projected_bench_points": bench_points,
+            "projected_total": projected_total,
+        }
+        if best is None or candidate["projected_total"] > best["projected_total"]:
+            best = candidate
+    if best is None:
+        raise ValueError("current_squad cannot produce a legal starting XI")
+
+    starting_players = best["starting_players"]
+    bench_players = best["bench_players"]
+    bench_order_players = best["bench_order_players"]
+    captain = best["captain_player"]
+    vice_captain = best["vice_captain_player"]
+    bench_boost_increment = float(best["projected_bench_points"])
+    return {
+        "formation": best["formation"],
+        "starting_xi": [
+            _lineup_player_row(player, signal_by_id[player.player_id])
+            for player in starting_players
+        ],
+        "bench_order": [
+            _lineup_player_row(player, signal_by_id[player.player_id])
+            for player in bench_order_players
+        ],
+        "captain": _lineup_player_row(captain, signal_by_id[captain.player_id]),
+        "vice_captain": _lineup_player_row(vice_captain, signal_by_id[vice_captain.player_id]),
+        "projected_start_points": round(float(best["projected_start_points"]), 3),
+        "projected_bench_points": round(bench_boost_increment, 3),
+        "projected_total_with_captain": round(float(best["projected_total"]), 3),
+        "projected_total_with_bench_boost": round(float(best["projected_total"]) + bench_boost_increment, 3),
+        "bench_boost_increment": round(bench_boost_increment, 3),
+        "method": "legal_formation_forecast_optimizer",
+        "note": "Only the starting XI scores normally; the four bench players add their forecast points only when Bench Boost is active.",
+    }
+
 
 def _key(recommendation: TransferRecommendation) -> tuple[str, str]:
     return recommendation.player_out_id, recommendation.player_in_id
@@ -169,13 +313,14 @@ def _live_chip_action(
         else ()
     )
     if chip == "bench_boost":
-        # Without historical fixture snapshots, use the four lowest projected
-        # current-squad players as a conservative bench proxy. The simulator
-        # uses the exact legal lineup when training/backtesting.
-        current_signals = [signal_by_id[player.player_id] for player in current_squad]
-        bench = sorted(current_signals, key=lambda signal: signal.next_expected_points or signal.short_expected_points)[:4]
-        short_points = sum(signal.next_expected_points or signal.short_expected_points for signal in bench)
-        long_points = sum(signal.long_expected_points / 8.0 for signal in bench)
+        lineup = choose_live_lineup(current_squad, signals)
+        bench_ids = {row["player_id"] for row in lineup["bench_order"]}
+        short_points = lineup["bench_boost_increment"]
+        long_points = sum(
+            signal.long_expected_points / 8.0
+            for signal in signals
+            if signal.player_id in bench_ids
+        )
     elif chip == "triple_captain":
         current_signals = [signal_by_id[player.player_id] for player in current_squad]
         captain = max(
@@ -260,6 +405,7 @@ def recommend_live_moves(
         signal_by_id = {signal.player_id: signal for signal in signal_rows}
         if len(current) != 15:
             raise ValueError(f"current_squad must contain exactly 15 players; received {len(current)}")
+        lineup_plan = choose_live_lineup(current, signal_rows)
         if int(config.free_transfers) < 1:
             return {
                 "strategy": "champion",
@@ -274,6 +420,7 @@ def recommend_live_moves(
                     "chips_available": sorted(set(CHIP_KINDS if chips_available is None else chips_available)),
                     "bank": config.bank,
                 },
+                "lineup_plan": lineup_plan,
                 "model_loaded": model is not None,
                 "warnings": [
                     "Frozen champion selected by temporal tournament; it does not spend paid hits or chips.",
@@ -319,6 +466,7 @@ def recommend_live_moves(
                     "chips_available": sorted(set(CHIP_KINDS if chips_available is None else chips_available)),
                     "bank": config.bank,
                 },
+                "lineup_plan": lineup_plan,
                 "model_loaded": model is not None,
                 "warnings": [
                     "Frozen champion selected by temporal tournament; hold is an intentional action.",
@@ -340,6 +488,7 @@ def recommend_live_moves(
                 "my_points": my_points,
                 "leader_points": leader_points,
             },
+            "lineup_plan": lineup_plan,
             "model_loaded": model is not None,
             "warnings": [
                 "Frozen champion selected by temporal tournament; it uses points, legality, prices, and the free-transfer constraint.",
@@ -367,6 +516,7 @@ def recommend_live_moves(
     )
     if missing_signals:
         raise ValueError(f"missing signals for player IDs: {missing_signals[:10]}")
+    lineup_plan = choose_live_lineup(current, signal_rows)
     if int(limit) < 1:
         raise ValueError("limit must be positive")
     profile = HYBRID_PROFILES[strategy]
@@ -539,7 +689,7 @@ def recommend_live_moves(
     warnings = [
         "This is the development-selected hybrid_win challenger, not a proven global-winning policy.",
         "The historical benchmark uses synthetic rival managers; it is not a claim of dominance over real FPL winners.",
-        "Live Bench Boost values use a four-player bench proxy; the historical simulator uses the exact legal lineup.",
+        "The live lineup plan uses the legal formation optimizer; actual autosubs still depend on confirmed minutes and late team news.",
     ]
     if model is None:
         warnings.append("No action-value model was loaded; scores are heuristic/rank-leverage fallback scores.")
@@ -565,6 +715,7 @@ def recommend_live_moves(
                 "behind_factor": behind,
                 "leading_factor": leading,
             },
+            "lineup_plan": lineup_plan,
             "model_loaded": model is not None,
             "warnings": warnings,
         }
@@ -586,6 +737,7 @@ def recommend_live_moves(
             "behind_factor": behind,
             "leading_factor": leading,
         },
+        "lineup_plan": lineup_plan,
         "model_loaded": model is not None,
         "warnings": warnings,
     }

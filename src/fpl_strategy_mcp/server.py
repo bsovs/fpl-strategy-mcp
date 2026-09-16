@@ -42,7 +42,7 @@ sys.path.insert(0, str(SOURCE_ROOT))
 sys.path.insert(0, str(ROOT))
 
 SERVER_NAME = "fpl-strategy"
-SERVER_VERSION = "0.1.5"
+SERVER_VERSION = "0.1.6"
 PROTOCOL_VERSION = "2024-11-05"
 PACKAGE_ASSETS = Path(__file__).resolve().parent / "assets"
 DEFAULT_MODEL = ROOT / "assets" / "action-policy-model.joblib"
@@ -767,6 +767,25 @@ def _recommend(arguments: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _lineup_plan(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Return the legal live formation, XI, bench order and captaincy."""
+
+    from fpl_lab.live_strategy import choose_live_lineup
+
+    state = _state_from_arguments(arguments)
+    lineup = choose_live_lineup(state["current"], state["signals"])
+    return {
+        "gameweek": state["gameweek"],
+        "lineup_plan": lineup,
+        "signal_source": state["signal_source"],
+        "warnings": state["state_warnings"]
+        + [
+            "Only the starting XI scores normally; the four bench players score only when Bench Boost is active.",
+            "The forecast lineup cannot know final autosubs until confirmed minutes and late team news are available.",
+        ],
+    }
+
+
 def _forecast_signals(arguments: dict[str, Any]) -> dict[str, Any]:
     """Expose the point-in-time signal table without making a decision."""
 
@@ -1268,7 +1287,7 @@ def _strategy_info() -> dict[str, Any]:
         ],
         "limitations": [
             "synthetic strategy league, not real rival-manager behavior",
-            "live Bench Boost uses a proxy lineup; historical backtests use the exact legal lineup",
+            "live lineup selection is forecast-based; final autosubs depend on confirmed minutes and late team news",
             "the frozen champion is currently the free-transfer points anchor because no learned override cleared the paired temporal guardrail",
             "model quality is not proven against global FPL winners",
         ],
@@ -1345,6 +1364,23 @@ TOOLS = [
                 },
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
                 "model_path": {"type": "string"},
+            },
+            "required": ["gameweek", "current_squad"],
+        },
+    },
+    {
+        "name": "fpl_lineup_plan",
+        "description": "Choose the legal current-week formation, starting XI, bench order, captain and vice-captain from the supplied 15-player squad. It also reports the projected bench points that Bench Boost would add; normally only the XI scores.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "gameweek": {"type": "integer", "minimum": 1, "maximum": 38},
+                "current_squad": {"type": "array", "items": {"type": "object"}},
+                "buyable_players": {"type": "array", "items": {"type": "object"}, "description": "Optional; omit to use the official bootstrap universe."},
+                "signals": {"type": "array", "items": {"type": "object"}},
+                "auto_official_signals": {"type": "boolean", "default": True},
+                "bootstrap_path": {"type": "string"},
+                "fetch_official": {"type": "boolean", "default": False},
             },
             "required": ["gameweek", "current_squad"],
         },
@@ -1483,6 +1519,8 @@ def _dispatch(request: dict[str, Any]) -> dict[str, Any] | None:
         try:
             if name == "fpl_recommend_moves":
                 payload = _recommend(arguments)
+            elif name == "fpl_lineup_plan":
+                payload = _lineup_plan(arguments)
             elif name == "fpl_search_players":
                 payload = _search_players(arguments)
             elif name == "fpl_forecast_signals":
