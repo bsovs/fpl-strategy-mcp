@@ -221,7 +221,7 @@ def _model_action_scores(
     )
     actions = [candidate.action for candidate in candidates]
     state = policy_state_from_runtime(
-        current, gameweek, squad_ids, bank_tenths, free_transfers
+        current, gameweek, squad_ids, bank_tenths, free_transfers, signals=signals
     )
     if isinstance(neural_policy, ActionValueEnsemble):
         means, uncertainty = neural_policy.predict_with_uncertainty([state] * len(actions), actions)

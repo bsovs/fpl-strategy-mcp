@@ -27,6 +27,16 @@ class PlayerState:
     price: float
     selling_price: float | None = None
     can_buy: bool = True
+    # Original purchase price is optional because live callers may not know
+    # it. When present, it lets the action model distinguish a normal sale
+    # from realizing a loss on a declining asset.
+    purchase_price: float | None = None
+
+    @property
+    def unrealized_loss(self) -> float:
+        if self.purchase_price is None:
+            return 0.0
+        return max(0.0, float(self.purchase_price) - float(self.price))
 
     @property
     def sell_value(self) -> float:
@@ -108,6 +118,7 @@ class TransferRecommendation:
     why: tuple[str, ...]
     risk_flags: tuple[str, ...]
     trigger: str
+    unrealized_loss: float = 0.0
 
 
 def _clip(value: float, low: float, high: float) -> float:
@@ -321,6 +332,8 @@ def recommend_transfers(
                 risk_flags.append("rotation risk")
             if signal_in.uncertainty >= 0.5:
                 risk_flags.append("high model uncertainty")
+            if player_out.unrealized_loss > 0:
+                risk_flags.append(f"realizing {player_out.unrealized_loss:.1f}m loss")
             recommendations.append(
                 TransferRecommendation(
                     player_out_id=player_out.player_id,
@@ -334,9 +347,13 @@ def recommend_transfers(
                     long_gain=round(long_gain, 3),
                     combined_score=round(combined, 3),
                     timing=timing,
-                    why=_why(in_short_components, in_long_components, signal_in, signal_out, config),
+                    why=tuple(
+                        list(_why(in_short_components, in_long_components, signal_in, signal_out, config))
+                        + (["accepting a loss for a stronger forward outlook"] if player_out.unrealized_loss > 0 else [])
+                    )[:4],
                     risk_flags=tuple(risk_flags),
                     trigger=signal_in.trigger,
+                    unrealized_loss=round(player_out.unrealized_loss, 2),
                 )
             )
     return sorted(recommendations, key=lambda recommendation: recommendation.combined_score, reverse=True)

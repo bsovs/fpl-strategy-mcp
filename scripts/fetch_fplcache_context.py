@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download sampled point-in-time official FPL news from fplcache.
+"""Download sampled point-in-time official FPL bootstrap data from fplcache.
 
 Randdalf/fplcache stores compressed bootstrap-static snapshots.  This adapter
 turns selected snapshots into the local context JSONL contract and preserves
@@ -114,6 +114,11 @@ def main() -> None:
     parser.add_argument("--max-files", type=int, default=0, help="optional download cap; 0 means no cap")
     parser.add_argument("--out", default="data/context/fplcache-news.jsonl")
     parser.add_argument("--manifest-out", default="data/context/fplcache-manifest.json")
+    parser.add_argument(
+        "--snapshot-out",
+        default=None,
+        help="optional JSONL archive of point-in-time official player fields",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -132,9 +137,46 @@ def main() -> None:
     events_by_id = {}
     active_roles: dict[str, tuple[str, str]] = {}
     failures: list[dict[str, str]] = []
+    snapshot_handle = None
+    snapshot_rows = 0
+    if args.snapshot_out:
+        snapshot_path = Path(args.snapshot_out)
+        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        snapshot_handle = snapshot_path.open("w", encoding="utf-8")
     for index, (path, snapshot_time) in enumerate(selected, start=1):
         try:
             payload = json.loads(lzma.decompress(_get_bytes(f"{RAW_ROOT}/{path}")).decode("utf-8"))
+            if snapshot_handle is not None:
+                for player in payload.get("elements", []):
+                    snapshot_handle.write(
+                        json.dumps(
+                            {
+                                "observed_at": snapshot_time.isoformat(),
+                                "player_id": player.get("id"),
+                                "team": player.get("team"),
+                                "status": player.get("status"),
+                                "chance_of_playing_this_round": player.get("chance_of_playing_this_round"),
+                                "chance_of_playing_next_round": player.get("chance_of_playing_next_round"),
+                                "ep_this": player.get("ep_this"),
+                                "ep_next": player.get("ep_next"),
+                                "form": player.get("form"),
+                                "points_per_game": player.get("points_per_game"),
+                                "selected_by_percent": player.get("selected_by_percent"),
+                                "transfers_in_event": player.get("transfers_in_event"),
+                                "transfers_out_event": player.get("transfers_out_event"),
+                                "value": (
+                                    player.get("value")
+                                    if player.get("value") is not None
+                                    else player.get("now_cost")
+                                ),
+                                "now_cost": player.get("now_cost"),
+                                "news": player.get("news"),
+                            },
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    )
+                    snapshot_rows += 1
             snapshot_events = bootstrap_news_events(payload, fetched_at=snapshot_time)
             current_roles: dict[str, str] = {}
             for event in snapshot_events:
@@ -176,6 +218,9 @@ def main() -> None:
         if index % 25 == 0 or index == len(selected):
             print(f"Processed {index:,}/{len(selected):,} snapshots; {len(events_by_id):,} unique events", flush=True)
 
+    if snapshot_handle is not None:
+        snapshot_handle.close()
+
     archive_end = selected[-1][1] + timedelta(hours=36) if selected else datetime.now(UTC)
     for event_id, _ in active_roles.values():
         previous = events_by_id.get(event_id)
@@ -196,6 +241,7 @@ def main() -> None:
         "dedupe_rule": "retain earliest observed_at for repeated event_id",
         "set_piece_rule": "retain one interval per player role state and close it when the official role changes or disappears",
         "observed_at_rule": "official bootstrap events are eligible only at or after the cache snapshot that contained them",
+        "official_snapshot_rows": snapshot_rows,
     }
     manifest_path = Path(args.manifest_out)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)

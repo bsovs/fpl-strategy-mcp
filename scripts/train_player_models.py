@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from fpl_lab.player_models import load_vaastav_gameweeks, run_extended_player_benchmark
 from fpl_lab.context import ContextStore, load_context_events
+from fpl_lab.official_archive import OfficialSnapshotStore
 
 
 def season_order(season: str) -> int:
@@ -34,6 +35,7 @@ def main() -> None:
     parser.add_argument("--output-dir", default="runs/player-models", help="directory for metrics, predictions and models")
     parser.add_argument("--news-context", action="append", default=[], help="backdated news JSON/JSONL/CSV")
     parser.add_argument("--social-context", action="append", default=[], help="backdated social JSON/JSONL/CSV")
+    parser.add_argument("--official-snapshots", default=None, help="archived bootstrap player snapshots")
     args = parser.parse_args()
 
     history_root = Path(args.history_root)
@@ -62,12 +64,20 @@ def main() -> None:
     context_store = ContextStore(context_events) if context_events else None
     if context_store is not None:
         print(f"Loaded {len(context_events):,} backdated context events", flush=True)
+    official_snapshot_store = (
+        OfficialSnapshotStore.from_path(args.official_snapshots)
+        if args.official_snapshots
+        else None
+    )
+    if official_snapshot_store is not None:
+        print(f"Loaded archived official bootstrap snapshots from {args.official_snapshots}", flush=True)
     result = run_extended_player_benchmark(
         raw,
         development_seasons=development,
         validation_season=args.validation_season,
         evaluation_season=args.evaluation_season,
         context_store=context_store,
+        official_snapshot_store=official_snapshot_store,
     )
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

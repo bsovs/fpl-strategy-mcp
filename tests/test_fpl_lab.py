@@ -11,8 +11,15 @@ from fpl_lab.data import Match, load_matches, to_team_observations
 from fpl_lab.decision import DecisionConfig, PlayerSignal, PlayerState, recommend_transfers
 from fpl_lab.model import PoissonTeamGoalsModel
 from fpl_lab.player_models import build_extended_player_feature_table, build_player_feature_table
+from fpl_lab.official_archive import OfficialSnapshotStore
 from fpl_lab.policy import ActionValueEnsemble, ActionValueMLP, PolicyAction, PolicyState, encode_state_action
-from fpl_lab.simulator import build_model_signal_cache, build_season_data, season_rules, selling_price_tenths
+from fpl_lab.simulator import (
+    build_model_signal_cache,
+    build_season_data,
+    recommendation_to_policy_action,
+    season_rules,
+    selling_price_tenths,
+)
 from fpl_strategy_mcp.server import _official_signal_rows
 
 
@@ -211,7 +218,7 @@ class FplLabTests(unittest.TestCase):
             current,
             buyable,
             signals,
-            DecisionConfig(free_transfers=1, bank=0.0, min_move_score=0.1),
+            DecisionConfig(free_transfers=1, bank=0.5, min_move_score=0.1),
         )
         self.assertEqual(len(recommendations), 1)
         self.assertEqual(recommendations[0].timing, "now")
@@ -229,10 +236,84 @@ class FplLabTests(unittest.TestCase):
         )
         self.assertEqual(recommendations, [])
 
+    def test_decision_layer_exposes_form_fixture_and_loss_tradeoff(self):
+        current = [
+            PlayerState(
+                "out",
+                "Out",
+                "MID",
+                "A",
+                7.0,
+                6.5,
+                True,
+                8.0,
+            )
+        ]
+        buyable = [PlayerState("in", "In", "MID", "B", 7.0)]
+        signals = [
+            PlayerSignal(
+                "out",
+                3.0,
+                20.0,
+                short_fixture_delta=-0.2,
+                long_fixture_delta=-0.1,
+                form_signal=-0.5,
+                value_signal=-0.3,
+                role_security=0.5,
+                price_change_risk=0.8,
+            ),
+            PlayerSignal(
+                "in",
+                5.5,
+                34.0,
+                short_fixture_delta=0.4,
+                long_fixture_delta=0.7,
+                form_signal=0.8,
+                value_signal=0.5,
+                role_security=0.9,
+                price_change_risk=0.1,
+            ),
+        ]
+        recommendations = recommend_transfers(
+            current,
+            buyable,
+            signals,
+            DecisionConfig(free_transfers=1, bank=0.5, min_move_score=0.1),
+        )
+        self.assertEqual(len(recommendations), 1)
+        recommendation = recommendations[0]
+        self.assertEqual(recommendation.unrealized_loss, 1.0)
+        self.assertTrue(any("accepting a loss" in reason for reason in recommendation.why))
+        self.assertIn("realizing 1.0m loss", recommendation.risk_flags)
+        action = recommendation_to_policy_action(
+            recommendation,
+            {signal.player_id: signal for signal in signals},
+        )
+        self.assertAlmostEqual(action.short_fixture_delta, 0.6)
+        self.assertAlmostEqual(action.long_fixture_delta, 0.8)
+        self.assertAlmostEqual(action.form_delta, 1.3)
+        self.assertAlmostEqual(action.value_delta, 0.8)
+        self.assertEqual(action.sell_loss, 1.0)
+
     def test_action_value_policy_uses_state_and_action_features(self):
-        state = PolicyState(gameweek=10, weeks_remaining=28, bank=1.0, free_transfers=1, squad_value=100.0)
+        state = PolicyState(
+            gameweek=10,
+            weeks_remaining=28,
+            bank=1.0,
+            free_transfers=1,
+            squad_value=100.0,
+            squad_news_risk=0.25,
+            squad_context_coverage=0.5,
+        )
         hold = PolicyAction(kind="hold")
-        transfer = PolicyAction(kind="transfer", hit_cost=0.0, short_points_delta=1.0, long_points_delta=3.0)
+        transfer = PolicyAction(
+            kind="transfer",
+            hit_cost=0.0,
+            short_points_delta=1.0,
+            long_points_delta=3.0,
+            short_minutes_delta=0.2,
+            news_risk_delta=-0.2,
+        )
         self.assertGreater(len(encode_state_action(state, transfer)), 20)
         policy = ActionValueMLP(hidden_layer_sizes=(8,))
         policy.fit([state, state, state], [hold, transfer, hold], [0.0, 2.0, 0.1])
@@ -325,6 +406,27 @@ class FplLabTests(unittest.TestCase):
         self.assertGreater(features.availability_delta, 0.0)
         self.assertGreater(features.set_piece_delta, 0.0)
         self.assertGreater(features.transfer_role_delta, 0.0)
+
+    def test_set_piece_interval_does_not_decay_while_active(self):
+        store = ContextStore.from_records(
+            [
+                {
+                    "event_id": "role",
+                    "published_at": "2026-09-01T10:00:00Z",
+                    "source": "official FPL",
+                    "title": "Player is first-choice penalty taker",
+                    "player_id": "7",
+                    "player_name": "Player",
+                    "team": "1",
+                    "event_type": "set_piece",
+                    "sentiment": 1.0,
+                    "expires_at": None,
+                }
+            ],
+            kind="news",
+        )
+        features = store.features_for_player("7", "Player", "1", "2026-10-01T10:00:00Z")
+        self.assertGreater(features.set_piece_delta, 0.9)
 
     def test_bootstrap_news_preserves_structured_event_type(self):
         events = bootstrap_news_events(
@@ -475,6 +577,49 @@ class FplLabTests(unittest.TestCase):
         )
         features = store.features_for_player("7", "Player", "1", "2026-09-01T10:00:00Z")
         self.assertEqual(features.event_count, 0)
+
+    def test_official_snapshot_store_is_point_in_time_and_exposes_availability(self):
+        path = self._write_jsonl(
+            [
+                {
+                    "observed_at": "2026-09-01T09:00:00Z",
+                    "player_id": "7",
+                    "status": "d",
+                    "chance_of_playing_next_round": 50,
+                    "ep_next": "4.2",
+                    "transfers_in_event": 1200,
+                    "now_cost": 75,
+                },
+                {
+                    "observed_at": "2026-09-01T12:00:00Z",
+                    "player_id": "7",
+                    "status": "a",
+                    "chance_of_playing_next_round": 100,
+                    "ep_next": "5.1",
+                    "transfers_in_event": 1800,
+                },
+            ]
+        )
+        try:
+            store = OfficialSnapshotStore.from_path(path)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        before = store.features_for_player("7", "2026-09-01T10:00:00Z")
+        after = store.features_for_player("7", "2026-09-01T13:00:00Z")
+        self.assertEqual(before["official_availability_probability"], 0.5)
+        self.assertEqual(after["official_availability_probability"], 1.0)
+        self.assertEqual(after["official_ep_next"], 5.1)
+        self.assertEqual(before["official_value"], 75.0)
+
+    @staticmethod
+    def _write_jsonl(rows):
+        import json
+
+        handle = tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False, encoding="utf-8")
+        for row in rows:
+            handle.write(json.dumps(row) + "\n")
+        handle.close()
+        return handle.name
 
     def test_selling_price_rounds_profit_down(self):
         self.assertEqual(selling_price_tenths(75, 78), 76)

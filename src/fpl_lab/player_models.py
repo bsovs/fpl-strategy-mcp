@@ -453,6 +453,45 @@ def _add_context_features(frame: pd.DataFrame, context_store: object | None) -> 
         frame[column] = context_frame[column].astype(float)
 
 
+def _add_official_snapshot_features(frame: pd.DataFrame, official_snapshot_store: object | None) -> None:
+    """Attach latest archived bootstrap estimates available at each cutoff."""
+
+    columns = (
+        "official_snapshot_available",
+        "official_availability_probability",
+        "official_chance_this_round",
+        "official_chance_next_round",
+        "official_ep_this",
+        "official_ep_next",
+        "official_form",
+        "official_points_per_game",
+        "official_selected_by_percent",
+        "official_transfers_in_event",
+        "official_transfers_out_event",
+        "official_value",
+        "official_news_present",
+        "official_snapshot_age_days",
+    )
+    if official_snapshot_store is None:
+        for column in columns:
+            frame[column] = 0.0
+        return
+    rows: list[dict[str, float]] = []
+    feature_cache: dict[tuple[str, str], dict[str, float]] = {}
+    for _, row in frame.iterrows():
+        player_id = str(int(row["element"])) if float(row.get("element", 0.0)) > 0 else ""
+        as_of = row.get("decision_time", row["kickoff_time"])
+        cache_key = (player_id, str(as_of))
+        features = feature_cache.get(cache_key)
+        if features is None:
+            features = official_snapshot_store.features_for_player(player_id, as_of)
+            feature_cache[cache_key] = features
+        rows.append(features)
+    snapshot_frame = pd.DataFrame(rows, index=frame.index)
+    for column in columns:
+        frame[column] = pd.to_numeric(snapshot_frame[column], errors="coerce").fillna(0.0).astype(float)
+
+
 PLAYER_GAMEWEEK_LAST_COLUMNS = frozenset(
     {"value", "selected", "transfers_in", "transfers_out", "transfers_balance"}
 )
@@ -494,6 +533,7 @@ def _broadcast_player_gameweek_features(
 def build_extended_player_feature_table(
     raw: pd.DataFrame,
     context_store: object | None = None,
+    official_snapshot_store: object | None = None,
 ) -> pd.DataFrame:
     """Build the richer point-in-time feature table used for model training.
 
@@ -812,6 +852,7 @@ def build_extended_player_feature_table(
         validate="many_to_one",
     )
     _add_context_features(frame, context_store)
+    _add_official_snapshot_features(frame, official_snapshot_store)
     frame["target_price_change"] = pd.to_numeric(frame["target_price_change"], errors="coerce")
     return frame.copy()
 
@@ -891,6 +932,20 @@ EXTENDED_NUMERIC_FEATURES = list(
             "context_event_count",
             "context_news_count",
             "context_social_count",
+            "official_snapshot_available",
+            "official_availability_probability",
+            "official_chance_this_round",
+            "official_chance_next_round",
+            "official_ep_this",
+            "official_ep_next",
+            "official_form",
+            "official_points_per_game",
+            "official_selected_by_percent",
+            "official_transfers_in_event",
+            "official_transfers_out_event",
+            "official_value",
+            "official_news_present",
+            "official_snapshot_age_days",
         ]
         + [
             f"{column}_{suffix}"
@@ -1159,6 +1214,7 @@ def run_extended_player_benchmark(
     evaluation_season: str,
     validation_season: str | None = None,
     context_store: object | None = None,
+    official_snapshot_store: object | None = None,
 ) -> BenchmarkResult:
     """Tune the expanded player/price forecasts without touching the test season.
 
@@ -1169,7 +1225,11 @@ def run_extended_player_benchmark(
     policy must still be judged inside the legal simulator.
     """
 
-    frame = build_extended_player_feature_table(raw, context_store=context_store)
+    frame = build_extended_player_feature_table(
+        raw,
+        context_store=context_store,
+        official_snapshot_store=official_snapshot_store,
+    )
     development = frame[frame["season"].isin(development_seasons)].copy()
     validation = frame[frame["season"] == validation_season].copy() if validation_season else pd.DataFrame()
     test = frame[frame["season"] == evaluation_season].copy()

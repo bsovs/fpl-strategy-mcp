@@ -309,7 +309,13 @@ class ContextStore:
             if not (direct_match or name_match or team_match):
                 continue
             age_hours = max(0.0, (cutoff - event.published_at).total_seconds() / 3600.0)
-            recency = float(np.exp(-age_hours / 48.0))
+            # A set-piece role is an interval state: once the official feed
+            # reports it, it should remain useful until the interval closes.
+            # Ordinary injury/news reports decay quickly because their
+            # information goes stale.  Applying the same 48-hour decay to a
+            # role snapshot would make a penalty/corner taker disappear after
+            # two weeks even when the role is still active.
+            recency = 1.0 if event.event_type == "set_piece" else float(np.exp(-age_hours / 48.0))
             match_weight = recency * _clip(event.reliability, 0.0, 1.0)
             if team_match:
                 match_weight *= 0.35

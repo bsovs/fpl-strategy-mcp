@@ -101,6 +101,11 @@ bootstrap pool and transparent fallback signals. Per-request weight changes go
 under `weight_overrides` (also accepted as `weights`); they do not modify the
 bundled model or the shipped champion.
 
+For loss-aware decisions, include each owned player’s current `price`,
+`selling_price`, and original `purchase_price` when available. The latter is
+optional; without it, the recommendation can still score the move but cannot
+explain or learn the cost of realizing a loss.
+
 ## Input
 
 Call `fpl_recommend_moves` with `gameweek` and `current_squad`, optionally
@@ -116,7 +121,13 @@ are omitted, the same official fallback is used automatically. Add
   `action_outcomes` such as `hold` and `transfer:out_id>in_id`; or
 - `history_root` and `season`: a full legal replay using Vaastav-format
   `season/gws/gw*.csv` files. Use separate development and held-out seasons and
-  starting-squad modes when tuning.
+starting-squad modes when tuning.
+
+The action learner explicitly carries short/long fixture-window deltas,
+recent form, value, role security, price-change risk, and any unrealized loss
+on the player being sold. That lets it distinguish a tactical
+three-gameweek punt from a season-long core hold and learn when a declining
+player is worth selling at a loss because the forward upgrade is stronger.
 
 See [`examples/`](examples/) for client configuration and a protocol smoke test. The official FPL bootstrap endpoint is used only when requested: `https://fantasy.premierleague.com/api/bootstrap-static/`.
 

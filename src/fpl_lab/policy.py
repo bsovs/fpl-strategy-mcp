@@ -73,6 +73,13 @@ class PolicyState:
     free_hit_available: bool = True
     bench_boost_available: bool = True
     triple_captain_available: bool = True
+    # Aggregate signal regime features.  These let the action learner learn
+    # when a squad is operating in a high-news/high-availability-risk state
+    # instead of treating every action delta as context-free.
+    squad_minutes_probability: float = 0.0
+    squad_news_risk: float = 0.0
+    squad_context_reliability: float = 0.0
+    squad_context_coverage: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -87,7 +94,21 @@ class PolicyAction:
     long_points_delta: float = 0.0
     short_price_delta: float = 0.0
     long_price_delta: float = 0.0
+    short_fixture_delta: float = 0.0
+    long_fixture_delta: float = 0.0
+    form_delta: float = 0.0
+    value_delta: float = 0.0
+    role_security_delta: float = 0.0
+    price_change_risk_delta: float = 0.0
+    sell_loss: float = 0.0
     ownership_leverage_delta: float = 0.0
+    short_minutes_delta: float = 0.0
+    long_minutes_delta: float = 0.0
+    news_risk_delta: float = 0.0
+    set_piece_delta: float = 0.0
+    transfer_role_delta: float = 0.0
+    context_reliability_delta: float = 0.0
+    uncertainty_delta: float = 0.0
     legal: bool = True
 
 
@@ -105,7 +126,116 @@ def encode_state_action(state: PolicyState, action: PolicyAction) -> np.ndarray:
     if rank_mode is None:
         raise ValueError(f"unknown rank mode: {state.rank_mode}")
     action_one_hot = [float(action.kind == kind) for kind in ACTION_KINDS]
-    return np.asarray(
+    return np.nan_to_num(np.asarray(
+        [
+            state.gameweek / 38.0,
+            state.weeks_remaining / 38.0,
+            state.bank / 15.0,
+            state.free_transfers / 3.0,
+            state.squad_value / 100.0,
+            state.rank_percentile,
+            state.target_rank_percentile,
+            state.template_ownership,
+            state.chip_flexibility,
+            float(state.wildcard_available),
+            float(state.free_hit_available),
+            float(state.bench_boost_available),
+            float(state.triple_captain_available),
+            float(np.clip(state.squad_minutes_probability, 0.0, 1.0)),
+            float(np.clip(state.squad_news_risk, 0.0, 1.0)),
+            float(np.clip(state.squad_context_reliability, 0.0, 1.0)),
+            float(np.clip(state.squad_context_coverage, 0.0, 1.0)),
+            rank_mode,
+            *action_one_hot,
+            float(action.legal),
+            action.hit_cost / 4.0,
+            action.short_points_delta,
+            action.long_points_delta,
+            action.short_price_delta,
+            action.long_price_delta,
+            action.short_fixture_delta,
+            action.long_fixture_delta,
+            action.form_delta,
+            action.value_delta,
+            action.role_security_delta,
+            action.price_change_risk_delta,
+            action.sell_loss,
+            action.ownership_leverage_delta,
+            action.short_minutes_delta,
+            action.long_minutes_delta,
+            action.news_risk_delta,
+            action.set_piece_delta,
+            action.transfer_role_delta,
+            action.context_reliability_delta,
+            action.uncertainty_delta,
+        ],
+        dtype=float,
+    ), nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _encode_state_action_context_v1(state: PolicyState, action: PolicyAction) -> np.ndarray:
+    """Encode the intermediate 38-feature policy schema.
+
+    This is kept only for loading the research model produced before explicit
+    form/fixture/value/loss action features were added.
+    """
+
+    if action.kind not in ACTION_KINDS:
+        raise ValueError(f"unknown action kind: {action.kind}")
+    rank_mode = {"neutral": 0.0, "chase": 1.0, "defend": -1.0}.get(state.rank_mode)
+    if rank_mode is None:
+        raise ValueError(f"unknown rank mode: {state.rank_mode}")
+    action_one_hot = [float(action.kind == kind) for kind in ACTION_KINDS]
+    return np.nan_to_num(np.asarray(
+        [
+            state.gameweek / 38.0,
+            state.weeks_remaining / 38.0,
+            state.bank / 15.0,
+            state.free_transfers / 3.0,
+            state.squad_value / 100.0,
+            state.rank_percentile,
+            state.target_rank_percentile,
+            state.template_ownership,
+            state.chip_flexibility,
+            float(state.wildcard_available),
+            float(state.free_hit_available),
+            float(state.bench_boost_available),
+            float(state.triple_captain_available),
+            float(np.clip(state.squad_minutes_probability, 0.0, 1.0)),
+            float(np.clip(state.squad_news_risk, 0.0, 1.0)),
+            float(np.clip(state.squad_context_reliability, 0.0, 1.0)),
+            float(np.clip(state.squad_context_coverage, 0.0, 1.0)),
+            rank_mode,
+            *action_one_hot,
+            float(action.legal),
+            action.hit_cost / 4.0,
+            action.short_points_delta,
+            action.long_points_delta,
+            action.short_price_delta,
+            action.long_price_delta,
+            action.ownership_leverage_delta,
+            action.short_minutes_delta,
+            action.long_minutes_delta,
+            action.news_risk_delta,
+            action.set_piece_delta,
+            action.transfer_role_delta,
+            action.context_reliability_delta,
+            action.uncertainty_delta,
+        ],
+        dtype=float,
+    ), nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _encode_state_action_legacy(state: PolicyState, action: PolicyAction) -> np.ndarray:
+    """Encode the original 27-feature shipped policy schema."""
+
+    if action.kind not in ACTION_KINDS:
+        raise ValueError(f"unknown action kind: {action.kind}")
+    rank_mode = {"neutral": 0.0, "chase": 1.0, "defend": -1.0}.get(state.rank_mode)
+    if rank_mode is None:
+        raise ValueError(f"unknown rank mode: {state.rank_mode}")
+    action_one_hot = [float(action.kind == kind) for kind in ACTION_KINDS]
+    return np.nan_to_num(np.asarray(
         [
             state.gameweek / 38.0,
             state.weeks_remaining / 38.0,
@@ -131,7 +261,7 @@ def encode_state_action(state: PolicyState, action: PolicyAction) -> np.ndarray:
             action.ownership_leverage_delta,
         ],
         dtype=float,
-    )
+    ), nan=0.0, posinf=0.0, neginf=0.0)
 
 
 class ActionValueMLP:
@@ -178,8 +308,19 @@ class ActionValueMLP:
         self.model.fit(features, targets)
         return self
 
+    def _encode_for_fitted_model(self, state: PolicyState, action: PolicyAction) -> np.ndarray:
+        expected = getattr(self.model.named_steps["scale"], "n_features_in_", None)
+        if expected == 27:
+            return _encode_state_action_legacy(state, action)
+        if expected == 38:
+            return _encode_state_action_context_v1(state, action)
+        return encode_state_action(state, action)
+
     def predict(self, states: Iterable[PolicyState], actions: Iterable[PolicyAction]) -> np.ndarray:
-        features = np.vstack([encode_state_action(state, action) for state, action in zip(states, actions)])
+        features = np.vstack([
+            self._encode_for_fitted_model(state, action)
+            for state, action in zip(states, actions)
+        ])
         return self.model.predict(features)
 
     def rank_actions(

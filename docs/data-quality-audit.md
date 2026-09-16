@@ -1,6 +1,6 @@
 # FPL historical data-quality audit
 
-Updated 16 September 2026 after the official-context action-policy replay.
+Updated 16 September 2026 after the form/fixture/loss-aware action-policy replay.
 
 ## Scope
 
@@ -83,6 +83,32 @@ change the transfer policy directly.
 This is evidence of a useful improvement over the anchor in this replay, not
 evidence of a winning FPL strategy. It is one held-out season with synthetic
 opening squads and synthetic continuation/rival behavior.
+
+## Form, fixture, value, and loss-aware action replay
+
+The next ablation promoted the decision-layer signals into explicit action
+features: short/long fixture-window deltas, recent form, relative value, role
+security, price-change risk, and the unrealized loss on the player being sold.
+Missing forecast values are normalized before entering the policy vector.
+
+| Metric | Result |
+|---|---:|
+| Development counterfactual examples | 1,500 |
+| Validation examples | 184 |
+| Validation action RMSE | 11.184 |
+| Validation action MAE | 6.020 |
+| Validation state-argmax accuracy | 43.75% |
+| 2025/26 neural mean | 1,990.50 |
+| 2025/26 neural best opening | 2,114 |
+| 2025/26 anchor mean | 1,983.75 |
+| 2025/26 cocktail mean | 1,991.75 |
+
+The neural policy beats its paired anchor by 6.75 points on the held-out mean;
+the cocktail beats it by 8.00. The best opening remains 299 points below the
+2,413 target, so this is an incremental action-selection improvement rather
+than a winning-strategy claim. The artifact is retained at
+`runs/action-policy-official-snapshot-v2/` and is not copied into the shipped
+MCP assets.
 
 ## Missing data that matters most
 

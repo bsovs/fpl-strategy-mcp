@@ -106,7 +106,9 @@ def _post_transfer_lineup(
     after_transfer = [
         player for player in current_squad if player.player_id != player_out.player_id
     ]
-    after_transfer.append(replace(player_in, selling_price=player_in.price))
+    after_transfer.append(
+        replace(player_in, selling_price=player_in.price, purchase_price=player_in.price)
+    )
     return choose_live_lineup(after_transfer, signals)
 
 
@@ -336,7 +338,9 @@ def _live_chip_bundle(
             break
         live_bank += player_out.sell_value - player_in.price
         live_current = [player for player in live_current if player.player_id != player_out.player_id]
-        live_current.append(replace(player_in, selling_price=player_in.price))
+        live_current.append(
+            replace(player_in, selling_price=player_in.price, purchase_price=player_in.price)
+        )
         live_buyable = [player for player in live_buyable if player.player_id != player_in.player_id]
         if all(player.player_id != player_out.player_id for player in live_buyable):
             live_buyable.append(replace(player_out, can_buy=True))
@@ -424,6 +428,37 @@ def _live_chip_action(
             - signal_by_id[item.player_out_id].ownership_leverage
             for item in bundle
         ),
+        short_fixture_delta=sum(
+            signal_by_id[item.player_in_id].short_fixture_delta
+            - signal_by_id[item.player_out_id].short_fixture_delta
+            for item in bundle
+        ),
+        long_fixture_delta=sum(
+            signal_by_id[item.player_in_id].long_fixture_delta
+            - signal_by_id[item.player_out_id].long_fixture_delta
+            for item in bundle
+        ),
+        form_delta=sum(
+            signal_by_id[item.player_in_id].form_signal
+            - signal_by_id[item.player_out_id].form_signal
+            for item in bundle
+        ),
+        value_delta=sum(
+            signal_by_id[item.player_in_id].value_signal
+            - signal_by_id[item.player_out_id].value_signal
+            for item in bundle
+        ),
+        role_security_delta=sum(
+            signal_by_id[item.player_in_id].role_security
+            - signal_by_id[item.player_out_id].role_security
+            for item in bundle
+        ),
+        price_change_risk_delta=sum(
+            signal_by_id[item.player_in_id].price_change_risk
+            - signal_by_id[item.player_out_id].price_change_risk
+            for item in bundle
+        ),
+        sell_loss=sum(item.unrealized_loss for item in bundle),
         legal=True,
     )
     return action, {
@@ -642,6 +677,31 @@ def recommend_live_moves(
     leading = float(
         np.clip(max(0.0, float(my_points) - float(leader_points)) / 30.0, 0.0, 1.0)
     )
+    squad_signal_rows = [
+        signal_by_id[player.player_id]
+        for player in current
+        if player.player_id in signal_by_id
+    ]
+    squad_minutes_probability = (
+        float(np.mean([np.clip(signal.short_minutes_probability, 0.0, 1.0) for signal in squad_signal_rows]))
+        if squad_signal_rows
+        else 0.0
+    )
+    squad_news_risk = (
+        float(np.mean([np.clip(signal.news_risk, 0.0, 1.0) for signal in squad_signal_rows]))
+        if squad_signal_rows
+        else 0.0
+    )
+    squad_context_reliability = (
+        float(np.mean([np.clip(signal.context_reliability, 0.0, 1.0) for signal in squad_signal_rows]))
+        if squad_signal_rows
+        else 0.0
+    )
+    squad_context_coverage = (
+        float(np.mean([signal.context_event_count > 0 for signal in squad_signal_rows]))
+        if squad_signal_rows
+        else 0.0
+    )
 
     state = PolicyState(
         gameweek=int(gameweek),
@@ -660,6 +720,10 @@ def recommend_live_moves(
         free_hit_available="free_hit" in available_chips,
         bench_boost_available="bench_boost" in available_chips,
         triple_captain_available="triple_captain" in available_chips,
+        squad_minutes_probability=squad_minutes_probability,
+        squad_news_risk=squad_news_risk,
+        squad_context_reliability=squad_context_reliability,
+        squad_context_coverage=squad_context_coverage,
     )
     hold_action = PolicyAction(kind="hold")
     action_rows: list[tuple[PolicyAction, TransferRecommendation | None, dict[str, Any] | None]] = [

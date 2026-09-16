@@ -243,6 +243,7 @@ def collect_counterfactual_examples(
             int(row["pre_bank_tenths"]),
             int(row["pre_free_transfers"]),
             chips_available=chips_available,
+            signals=signals,
         )
         for candidate in candidates:
             (

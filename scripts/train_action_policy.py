@@ -31,6 +31,7 @@ from fpl_lab.player_models import (
     load_vaastav_gameweeks,
 )
 from fpl_lab.context import ContextStore, load_context_events
+from fpl_lab.official_archive import OfficialSnapshotStore
 from fpl_lab.policy import ActionValueEnsemble
 from fpl_lab.policy_training import (
     collect_counterfactual_examples,
@@ -313,6 +314,11 @@ def main() -> None:
     parser.add_argument("--news-context", action="append", default=[], help="backdated news JSON/JSONL/CSV; only events before each simulated deadline are used")
     parser.add_argument("--social-context", action="append", default=[], help="backdated social JSON/JSONL/CSV; only events before each simulated deadline are used")
     parser.add_argument(
+        "--official-snapshots",
+        default=None,
+        help="archived bootstrap player snapshots; only the latest row observed before each deadline is used",
+    )
+    parser.add_argument(
         "--starting-modes",
         nargs="+",
         choices=("points", "value", "template", "randomized_points", "forecast"),
@@ -344,7 +350,18 @@ def main() -> None:
     context_store = ContextStore(context_events) if context_events else None
     if context_store is not None:
         print(f"Loaded {len(context_events):,} backdated context events", flush=True)
-    feature_frame = build_extended_player_feature_table(raw, context_store=context_store)
+    official_snapshot_store = (
+        OfficialSnapshotStore.from_path(args.official_snapshots)
+        if args.official_snapshots
+        else None
+    )
+    if official_snapshot_store is not None:
+        print(f"Loaded archived official bootstrap snapshots from {args.official_snapshots}", flush=True)
+    feature_frame = build_extended_player_feature_table(
+        raw,
+        context_store=context_store,
+        official_snapshot_store=official_snapshot_store,
+    )
     cache_seasons = development + [args.validation_season, args.evaluation_season]
     availability_quality: list[dict[str, Any]] = []
     caches = _forecast_caches(

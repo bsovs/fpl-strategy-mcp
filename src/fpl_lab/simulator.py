@@ -31,6 +31,16 @@ INITIAL_SQUAD_MODES = ("points", "value", "template", "randomized_points")
 CHIP_KINDS = ("wildcard", "free_hit", "bench_boost", "triple_captain")
 
 
+def _finite_float(value: object, default: float = 0.0) -> float:
+    """Convert a feature to a finite float without letting NaN enter policy state."""
+
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return parsed if np.isfinite(parsed) else float(default)
+
+
 @dataclass(frozen=True)
 class PlayerSnapshot:
     player_id: str
@@ -487,39 +497,75 @@ def build_model_signal_cache(
         # player whose source row is missing in this GW; ``current.snapshot``
         # then supplies the last known price/identity for that player.
         player_ids = set(current.history_by_player).union(current.snapshots_by_gw[gameweek])
+        projected_value_ratios: dict[str, list[float]] = {}
+        projected_short_points: dict[str, float] = {}
+        for player_id in player_ids:
+            row = by_id.get(str(player_id))
+            snapshot = current.snapshot(player_id, gameweek)
+            if row is None or snapshot is None:
+                continue
+            next_points = max(0.0, _finite_float(row.extended_selected))
+            short_fixture_count = max(
+                1.0,
+                _finite_float(getattr(row, "fixtures_current_gw", 1.0), 1.0)
+                + _finite_float(getattr(row, "fixtures_next_2", 0.0)),
+            )
+            direct_short = getattr(row, "forecast_short_expected_points", None)
+            short_points = (
+                max(0.0, _finite_float(direct_short))
+                if direct_short is not None and pd.notna(direct_short)
+                else next_points * max(1.0, min(float(short_horizon), short_fixture_count))
+            )
+            projected_short_points[player_id] = short_points
+            projected_value_ratios.setdefault(snapshot.position, []).append(
+                short_points / max(0.1, snapshot.price)
+            )
+        value_medians = {
+            position: float(np.median(ratios))
+            for position, ratios in projected_value_ratios.items()
+            if ratios
+        }
         for player_id in sorted(player_ids):
             row = by_id.get(str(player_id))
             if row is None:
                 signals.append(PlayerSignal(player_id=player_id, short_expected_points=0.0, long_expected_points=0.0))
                 continue
-            next_points = max(0.0, float(row.extended_selected))
-            price_change = float(row.future_price_change_ridge)
-            minutes_share = float(getattr(row, "minutes_share_5", 0.0) or 0.0)
-            form_acceleration = float(getattr(row, "form_acceleration", 0.0) or 0.0)
-            news_risk = float(getattr(row, "news_risk", 0.0) or 0.0)
-            news_sentiment = float(getattr(row, "news_sentiment", 0.0) or 0.0)
-            social_sentiment = float(getattr(row, "social_sentiment", 0.0) or 0.0)
-            set_piece_signal = float(getattr(row, "context_set_piece_delta", 0.0) or 0.0)
-            transfer_role_signal = float(getattr(row, "context_transfer_role_delta", 0.0) or 0.0)
-            short_fixtures = float(getattr(row, "fixtures_next_3", short_horizon) or short_horizon)
-            long_fixtures = float(getattr(row, "fixtures_next_5", long_horizon) or long_horizon)
-            current_fixtures = max(1.0, float(getattr(row, "fixtures_current_gw", 1.0) or 1.0))
+            next_points = max(0.0, _finite_float(row.extended_selected))
+            price_change = _finite_float(row.future_price_change_ridge)
+            minutes_share = _finite_float(getattr(row, "minutes_share_5", 0.0))
+            form_acceleration = _finite_float(getattr(row, "form_acceleration", 0.0))
+            news_risk = _finite_float(getattr(row, "news_risk", 0.0))
+            news_sentiment = _finite_float(getattr(row, "news_sentiment", 0.0))
+            social_sentiment = _finite_float(getattr(row, "social_sentiment", 0.0))
+            set_piece_signal = _finite_float(getattr(row, "context_set_piece_delta", 0.0))
+            transfer_role_signal = _finite_float(getattr(row, "context_transfer_role_delta", 0.0))
+            short_fixtures = _finite_float(getattr(row, "fixtures_next_3", short_horizon), short_horizon)
+            long_fixtures = _finite_float(getattr(row, "fixtures_next_5", long_horizon), long_horizon)
+            current_fixtures = max(1.0, _finite_float(getattr(row, "fixtures_current_gw", 1.0), 1.0))
             short_fixture_count = max(
                 1.0,
-                current_fixtures + float(getattr(row, "fixtures_next_2", max(0.0, short_fixtures - 1.0)) or 0.0),
+                current_fixtures
+                + _finite_float(
+                    getattr(row, "fixtures_next_2", max(0.0, short_fixtures - 1.0)),
+                    max(0.0, short_fixtures - 1.0),
+                ),
             )
             long_fixture_count = max(
                 1.0,
-                current_fixtures + float(getattr(row, "fixtures_next_7", max(0.0, long_fixtures - 1.0)) or 0.0),
+                current_fixtures
+                + _finite_float(
+                    getattr(row, "fixtures_next_7", max(0.0, long_fixtures - 1.0)),
+                    max(0.0, long_fixtures - 1.0),
+                ),
             )
             direct_short = getattr(row, "forecast_short_expected_points", None)
             direct_long = getattr(row, "forecast_long_expected_points", None)
             if direct_short is not None and pd.notna(direct_short):
-                short_points = max(0.0, float(direct_short))
+                short_points = max(0.0, _finite_float(direct_short))
             else:
                 short_points = next_points * max(1.0, min(float(short_horizon), short_fixtures))
             if direct_long is not None and pd.notna(direct_long):
-                long_points = max(0.0, float(direct_long))
+                long_points = max(0.0, _finite_float(direct_long))
             else:
                 long_points = next_points * max(1.0, min(float(long_horizon), long_fixtures))
             historical_minutes = max(0.0, minutes_share * 90.0 * current_fixtures)
@@ -544,6 +590,20 @@ def build_model_signal_cache(
             short_minutes_probability = float(np.clip(short_minutes / (90.0 * short_fixture_count), 0.0, 1.0))
             long_minutes_probability = float(np.clip(long_minutes / (90.0 * long_fixture_count), 0.0, 1.0))
             current_minutes_probability = float(np.clip(current_minutes / (90.0 * current_fixtures), 0.0, 1.0))
+            snapshot = current.snapshot(player_id, gameweek)
+            short_fixture_delta = (short_fixture_count - float(short_horizon)) * 0.10
+            long_fixture_delta = (long_fixture_count - float(long_horizon)) * 0.10
+            value_signal = 0.0
+            if snapshot is not None and snapshot.position in value_medians:
+                value_signal = float(
+                    np.clip(
+                        (projected_short_points.get(player_id, 0.0) / max(0.1, snapshot.price))
+                        / max(0.1, value_medians[snapshot.position])
+                        - 1.0,
+                        -1.0,
+                        1.0,
+                    )
+                )
             signals.append(
                 PlayerSignal(
                     player_id=player_id,
@@ -552,7 +612,10 @@ def build_model_signal_cache(
                     next_expected_points=next_points,
                     short_minutes_probability=short_minutes_probability,
                     long_minutes_probability=long_minutes_probability,
+                    short_fixture_delta=short_fixture_delta,
+                    long_fixture_delta=long_fixture_delta,
                     form_signal=float(np.clip(form_acceleration / 3.0, -1.0, 1.0)),
+                    value_signal=value_signal,
                     role_security=current_minutes_probability,
                     injury_risk=float(np.clip(1.0 - current_minutes_probability, 0.0, 1.0)),
                     rotation_risk=float(np.clip(0.5 * (1.0 - current_minutes_probability), 0.0, 1.0)),
@@ -914,6 +977,7 @@ def _states_for_decision(
                 team=snapshot.team,
                 price=snapshot.price,
                 selling_price=selling_price_tenths(purchase_prices[player_id], snapshot.price_tenths) / 10.0,
+                purchase_price=purchase_prices[player_id] / 10.0,
             )
         )
     buyable = [
@@ -1054,6 +1118,7 @@ def policy_state_from_runtime(
     bank_tenths: int,
     free_transfers: int,
     chips_available: Iterable[str] | None = None,
+    signals: Iterable[PlayerSignal] | None = None,
 ) -> PolicyState:
     """Encode the observable simulator state at a transfer deadline."""
 
@@ -1065,6 +1130,26 @@ def policy_state_from_runtime(
     )
     last_gameweek = max(current.snapshots_by_gw)
     available = set(CHIP_KINDS if chips_available is None else chips_available)
+    signal_by_id = {signal.player_id: signal for signal in (signals or ())}
+    squad_signals = [signal_by_id[player_id] for player_id in ids if player_id in signal_by_id]
+    if squad_signals:
+        squad_minutes_probability = float(
+            np.mean([np.clip(signal.short_minutes_probability, 0.0, 1.0) for signal in squad_signals])
+        )
+        squad_news_risk = float(
+            np.mean([np.clip(signal.news_risk, 0.0, 1.0) for signal in squad_signals])
+        )
+        squad_context_reliability = float(
+            np.mean([np.clip(signal.context_reliability, 0.0, 1.0) for signal in squad_signals])
+        )
+        squad_context_coverage = float(
+            np.mean([signal.context_event_count > 0 for signal in squad_signals])
+        )
+    else:
+        squad_minutes_probability = 0.0
+        squad_news_risk = 0.0
+        squad_context_reliability = 0.0
+        squad_context_coverage = 0.0
     return PolicyState(
         gameweek=gameweek,
         weeks_remaining=max(0, last_gameweek - gameweek + 1),
@@ -1076,6 +1161,10 @@ def policy_state_from_runtime(
         free_hit_available="free_hit" in available,
         bench_boost_available="bench_boost" in available,
         triple_captain_available="triple_captain" in available,
+        squad_minutes_probability=squad_minutes_probability,
+        squad_news_risk=squad_news_risk,
+        squad_context_reliability=squad_context_reliability,
+        squad_context_coverage=squad_context_coverage,
     )
 
 
@@ -1096,7 +1185,21 @@ def recommendation_to_policy_action(
         long_points_delta=recommendation.long_gain,
         short_price_delta=signal_in.short_price_signal - signal_out.short_price_signal,
         long_price_delta=signal_in.long_price_signal - signal_out.long_price_signal,
+        short_fixture_delta=signal_in.short_fixture_delta - signal_out.short_fixture_delta,
+        long_fixture_delta=signal_in.long_fixture_delta - signal_out.long_fixture_delta,
+        form_delta=signal_in.form_signal - signal_out.form_signal,
+        value_delta=signal_in.value_signal - signal_out.value_signal,
+        role_security_delta=signal_in.role_security - signal_out.role_security,
+        price_change_risk_delta=signal_in.price_change_risk - signal_out.price_change_risk,
+        sell_loss=recommendation.unrealized_loss,
         ownership_leverage_delta=signal_in.ownership_leverage - signal_out.ownership_leverage,
+        short_minutes_delta=signal_in.short_minutes_probability - signal_out.short_minutes_probability,
+        long_minutes_delta=signal_in.long_minutes_probability - signal_out.long_minutes_probability,
+        news_risk_delta=signal_in.news_risk - signal_out.news_risk,
+        set_piece_delta=signal_in.set_piece_signal - signal_out.set_piece_signal,
+        transfer_role_delta=signal_in.transfer_role_signal - signal_out.transfer_role_signal,
+        context_reliability_delta=signal_in.context_reliability - signal_out.context_reliability,
+        uncertainty_delta=signal_in.uncertainty - signal_out.uncertainty,
         legal=True,
     )
 
@@ -1266,6 +1369,72 @@ def build_neural_action_candidates(
                 - signal_by_id[recommendation.player_out_id].ownership_leverage
                 for recommendation in bundle
             ),
+            short_fixture_delta=sum(
+                signal_by_id[recommendation.player_in_id].short_fixture_delta
+                - signal_by_id[recommendation.player_out_id].short_fixture_delta
+                for recommendation in bundle
+            ),
+            long_fixture_delta=sum(
+                signal_by_id[recommendation.player_in_id].long_fixture_delta
+                - signal_by_id[recommendation.player_out_id].long_fixture_delta
+                for recommendation in bundle
+            ),
+            form_delta=sum(
+                signal_by_id[recommendation.player_in_id].form_signal
+                - signal_by_id[recommendation.player_out_id].form_signal
+                for recommendation in bundle
+            ),
+            value_delta=sum(
+                signal_by_id[recommendation.player_in_id].value_signal
+                - signal_by_id[recommendation.player_out_id].value_signal
+                for recommendation in bundle
+            ),
+            role_security_delta=sum(
+                signal_by_id[recommendation.player_in_id].role_security
+                - signal_by_id[recommendation.player_out_id].role_security
+                for recommendation in bundle
+            ),
+            price_change_risk_delta=sum(
+                signal_by_id[recommendation.player_in_id].price_change_risk
+                - signal_by_id[recommendation.player_out_id].price_change_risk
+                for recommendation in bundle
+            ),
+            sell_loss=sum(recommendation.unrealized_loss for recommendation in bundle),
+            short_minutes_delta=sum(
+                signal_by_id[recommendation.player_in_id].short_minutes_probability
+                - signal_by_id[recommendation.player_out_id].short_minutes_probability
+                for recommendation in bundle
+            ),
+            long_minutes_delta=sum(
+                signal_by_id[recommendation.player_in_id].long_minutes_probability
+                - signal_by_id[recommendation.player_out_id].long_minutes_probability
+                for recommendation in bundle
+            ),
+            news_risk_delta=sum(
+                signal_by_id[recommendation.player_in_id].news_risk
+                - signal_by_id[recommendation.player_out_id].news_risk
+                for recommendation in bundle
+            ),
+            set_piece_delta=sum(
+                signal_by_id[recommendation.player_in_id].set_piece_signal
+                - signal_by_id[recommendation.player_out_id].set_piece_signal
+                for recommendation in bundle
+            ),
+            transfer_role_delta=sum(
+                signal_by_id[recommendation.player_in_id].transfer_role_signal
+                - signal_by_id[recommendation.player_out_id].transfer_role_signal
+                for recommendation in bundle
+            ),
+            context_reliability_delta=sum(
+                signal_by_id[recommendation.player_in_id].context_reliability
+                - signal_by_id[recommendation.player_out_id].context_reliability
+                for recommendation in bundle
+            ),
+            uncertainty_delta=sum(
+                signal_by_id[recommendation.player_in_id].uncertainty
+                - signal_by_id[recommendation.player_out_id].uncertainty
+                for recommendation in bundle
+            ),
             legal=True,
         )
         candidates.append(
@@ -1304,6 +1473,7 @@ def _choose_neural_action(
         bank_tenths,
         free_transfers,
         chips_available=chips_available,
+        signals=signals,
     )
     actions = [candidate.action for candidate in candidates]
     ranked = neural_policy.rank_actions(state, actions, risk_aversion=0.20)
@@ -1423,6 +1593,7 @@ def _choose_cocktail_action(
         bank_tenths,
         free_transfers,
         chips_available=available_chips,
+        signals=signals,
     )
     actions = [candidate.action for candidate in candidates]
     if isinstance(neural_policy, ActionValueEnsemble):
