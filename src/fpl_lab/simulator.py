@@ -438,8 +438,17 @@ def build_model_signal_cache(
     frame["future_price_change_ridge"] = pd.to_numeric(
         frame["future_price_change_ridge"], errors="coerce"
     ).fillna(0.0)
+    # A double gameweek has one forecast row per fixture, but the simulator
+    # needs one decision-time signal per player/GW. Preserve the latest
+    # point-in-time context while summing the fixture-level point forecasts;
+    # silently keeping the last fixture understates Bench Boost and captaincy
+    # value and can change wildcard/Free Hit rankings.
     if frame.duplicated(["gameweek", "player_id"]).any():
-        frame = frame.drop_duplicates(["gameweek", "player_id"], keep="last")
+        point_totals = frame.groupby(["gameweek", "player_id"], as_index=False)["extended_selected"].sum()
+        frame = frame.drop_duplicates(["gameweek", "player_id"], keep="last").drop(
+            columns=["extended_selected"]
+        )
+        frame = frame.merge(point_totals, on=["gameweek", "player_id"], how="left", validate="one_to_one")
 
     result: dict[int, list[PlayerSignal]] = {}
     for gameweek in sorted(current.snapshots_by_gw):

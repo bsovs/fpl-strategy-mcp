@@ -12,7 +12,7 @@ from fpl_lab.decision import DecisionConfig, PlayerSignal, PlayerState, recommen
 from fpl_lab.model import PoissonTeamGoalsModel
 from fpl_lab.player_models import build_extended_player_feature_table, build_player_feature_table
 from fpl_lab.policy import ActionValueEnsemble, ActionValueMLP, PolicyAction, PolicyState, encode_state_action
-from fpl_lab.simulator import season_rules, selling_price_tenths
+from fpl_lab.simulator import build_model_signal_cache, build_season_data, season_rules, selling_price_tenths
 
 
 def synthetic_matches() -> list[Match]:
@@ -139,6 +139,24 @@ class FplLabTests(unittest.TestCase):
         self.assertTrue(pd.isna(opening["total_points_last"]))
         self.assertEqual(opening["career_total_points_last"], 9)
         self.assertEqual(opening["career_games_before"], 1)
+
+    def test_model_signal_cache_sums_double_gameweek_forecasts(self):
+        raw = pd.DataFrame(
+            [
+                {"name": "Player", "element": 7, "position": "MID", "team": 1, "opponent_team": 2, "gameweek": 1, "fixture": 1, "value": 70, "total_points": 0, "season": "2024-25"},
+                {"name": "Player", "element": 7, "position": "MID", "team": 1, "opponent_team": 3, "gameweek": 1, "fixture": 2, "value": 70, "total_points": 0, "season": "2024-25"},
+            ]
+        )
+        current = build_season_data(raw, "2024-25")
+        forecasts = pd.DataFrame(
+            [
+                {"gameweek": 1, "element": 7, "extended_selected": 4.0},
+                {"gameweek": 1, "element": 7, "extended_selected": 5.0},
+            ]
+        )
+        cache = build_model_signal_cache(current, forecasts)
+        player_signal = next(signal for signal in cache[1] if signal.player_id == "7")
+        self.assertEqual(player_signal.next_expected_points, 9.0)
 
     def test_decision_layer_scores_legal_same_position_move(self):
         current = [PlayerState("out", "Out", "MID", "A", 7.0, 6.9)]

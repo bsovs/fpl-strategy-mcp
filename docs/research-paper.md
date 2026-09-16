@@ -160,33 +160,39 @@ recomputes bank, selling price, team caps, position legality, and the already
 selected players. This prevents the action learner from treating every move
 as an isolated one-for-one transfer.
 
+The forecast bridge also aggregates fixture-level predictions to one
+player/gameweek signal by summing double-gameweek fixtures. This is required
+for correct Bench Boost, captain, Free Hit, and transfer comparisons; keeping
+only one fixture would understate the value of a double gameweek.
+
 This is still a small benchmark. It is designed to prevent premature claims,
 not to establish a final public leaderboard.
 
 ## 4. Current results
 
-The larger career-feature action run generated 1,440 development and 176
-validation counterfactual examples. The default action ensemble was selected
-on validation (RMSE 7.105 versus 7.224 for the small ensemble; state-level
-argmax accuracy 37.5% versus 18.75%). On 2024–25, the neural policy averaged
-2,042.5 points across the four opening families versus 2,009.0 for the
-points-only free-transfer anchor. This advantage was not uniform: one value
-opening favored the anchor, so the result is not a deployment guarantee.
+The corrected career-feature action run generated 1,441 development and 177
+validation counterfactual examples. The smaller action ensemble was selected
+on validation (RMSE 7.983 versus 8.695 for the default ensemble; state-level
+argmax accuracy 18.75% versus 25%). On 2024–25, the neural policy averaged
+2,129.0 points across the four opening families versus 2,060.25 for the
+points-only free-transfer anchor. This advantage was not uniform: the value
+and randomized openings favored the anchor, so the result is not a deployment
+guarantee.
 
-On the untouched 2025–26 replay, the neural policy averaged 2,058.75 points
-versus 1,929.5 for that run's anchor, with paired gains of 127, 96, 105, and
-189 points across the four opening families. The best neural opening scored
-2,111 points. This is encouraging as a policy-layer integration result, but
-it remains 302 points below the 2,413 research target and is based on one
-held-out season with synthetic opening squads. The artifact is therefore not
-promoted to the public MCP champion yet.
+On the untouched 2025–26 replay, the corrected neural policy averaged 2,021.0
+points versus 1,915.25 for that run's anchor, with paired gains of 78, 65,
+170, and 110 points across the four opening families. The best neural opening
+scored 2,079 points. This remains 334 points below the 2,413 research target
+and is based on one held-out season with synthetic opening squads. The
+artifact is therefore not promoted to the public MCP champion yet.
 
 The anchored cocktail was also replayed with the same action model and legal
-search. It averaged 2,047.5 on validation and 1,931.5 on 2025–26, versus the
-neural policy's 2,058.75 on that test. In this run the default gate was too
-permissive around repeated transfers and did not improve the held-out result;
-the transparent anchor remains the safer deployed fallback while gate tuning
-is treated as a separate validation-only experiment.
+search. It averaged 2,095.75 on validation and 1,975.75 on 2025–26, versus
+the neural policy's 2,021.0 on that test. The cocktail was better than the
+anchor on average but worse than raw neural, with negative gains in two of the
+four test opening families; the transparent anchor remains the safer deployed
+fallback while gate tuning is treated as a separate validation-only
+experiment.
 
 The result also illustrates why “the neural network scored more on average” is
 not enough. The action space is path-dependent, chip timing has opportunity
@@ -200,9 +206,7 @@ strategy benchmark/aspiration, not as a supervised player-point label.
 Clearing it requires more historical action states, stronger expected-minutes
 and multi-horizon fixture forecasts, a real league/rival model, and held-out
 families of starting squads; a player forecast that ranks well is not
-sufficient. A forecast-driven legal opening squad was also tested separately
-with the trained policy and scored 2,097 on 2025–26, so simply changing the
-opening optimizer did not close the gap.
+sufficient.
 
 ## 5. News, social context, and price information
 

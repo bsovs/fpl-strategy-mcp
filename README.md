@@ -205,9 +205,9 @@ This generates legal counterfactual action labels, fits the action ensemble,
 and evaluates neural actions against the free-transfer anchor over points,
 value, template, and randomized opening squads. The current career-feature
 run produced 1,440 development and 176 validation examples; on the untouched
-2025/26 replay its best opening family scored 2,111 points, below the 2,413
+2025/26 replay its best opening family scored 2,079 points, below the 2,413
 research target. It is therefore a research artifact, not a promoted
-champion. The same run's anchored cocktail averaged 1,931.5 on the untouched
+champion. The same corrected run's anchored cocktail averaged 1,975.75 on the untouched
 test, so the current public fallback remains the transparent anchor until the
 gate is tuned on additional held-out seasons.
 
