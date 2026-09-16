@@ -573,7 +573,48 @@ def build_extended_player_feature_table(
     frame["price_momentum"] = value_prior - _rolling_prior(frame, value_prior, 5, group_column="player_season_key")
     frame["value_per_point_5"] = frame["value_mean_5"] / (frame["points_mean_5"] + 1.0)
     frame["points_per_value_5"] = frame["points_mean_5"] / (frame["value_mean_5"] + 1.0)
-    frame["target_price_change"] = player_group["value"].shift(-1) - frame["value"]
+    # Price changes are gameweek-level labels.  Using the next fixture row
+    # would create a spurious zero/within-double-GW movement when a player has
+    # two fixtures in the same gameweek.  Build the label on distinct
+    # player/gameweek rows, then broadcast it back to every fixture row.
+    price_labels = (
+        frame[["player_season_key", "sequence", "value"]]
+        .drop_duplicates(["player_season_key", "sequence"], keep="last")
+        .sort_values(["player_season_key", "sequence"])
+    )
+    price_labels["next_gameweek_value"] = price_labels.groupby("player_season_key", sort=False)["value"].shift(-1)
+    price_labels["target_price_change"] = price_labels["next_gameweek_value"] - price_labels["value"]
+    frame = frame.merge(
+        price_labels[["player_season_key", "sequence", "target_price_change"]],
+        on=["player_season_key", "sequence"],
+        how="left",
+        validate="many_to_one",
+    )
+
+    # Direct multi-horizon labels are more useful for transfer decisions than
+    # multiplying a one-fixture forecast by a fixture count.  Aggregate the
+    # realized points to distinct player/gameweek rows first, so a double GW
+    # contributes both fixtures exactly once to the 3- and 8-GW targets.
+    horizon_labels = (
+        frame.groupby(["player_season_key", "sequence"], as_index=False, sort=False)["total_points"]
+        .sum()
+        .rename(columns={"total_points": "gameweek_points"})
+        .sort_values(["player_season_key", "sequence"])
+    )
+    grouped_horizon = horizon_labels.groupby("player_season_key", sort=False)
+    for horizon in (3, 8):
+        horizon_labels[f"target_horizon_points_{horizon}"] = sum(
+            grouped_horizon["gameweek_points"].shift(-offset).fillna(0.0)
+            for offset in range(horizon)
+        )
+    frame = frame.merge(
+        horizon_labels[
+            ["player_season_key", "sequence", "target_horizon_points_3", "target_horizon_points_8"]
+        ],
+        on=["player_season_key", "sequence"],
+        how="left",
+        validate="many_to_one",
+    )
 
     # Fixture shape is allowed to look forward only at schedule fields, never
     # at future scores or player outcomes.  The final archive schedule can

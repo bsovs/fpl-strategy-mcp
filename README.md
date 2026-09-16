@@ -203,13 +203,22 @@ PYTHONPATH=src python scripts/train_action_policy.py \
 
 This generates legal counterfactual action labels, fits the action ensemble,
 and evaluates neural actions against the free-transfer anchor over points,
-value, template, and randomized opening squads. The current career-feature
-run produced 1,440 development and 176 validation examples; on the untouched
-2025/26 replay its best opening family scored 2,079 points, below the 2,413
-research target. It is therefore a research artifact, not a promoted
-champion. The same corrected run's anchored cocktail averaged 1,975.75 on the untouched
-test, so the current public fallback remains the transparent anchor until the
-gate is tuned on additional held-out seasons.
+value, template, and randomized opening squads. The forecast bridge is
+walk-forward: it fits point forecasts, direct 3/8-gameweek totals, and a
+next-gameweek price-change model using only earlier seasons. The current
+career-feature baseline produced 1,441 development and 177 validation
+examples; on the untouched 2025/26 replay its best opening family scored
+2,079 points, below the 2,413 research target. It is therefore a research
+artifact, not a promoted champion. The same corrected run's anchored cocktail
+averaged 1,975.75 on the untouched test, so the current public fallback
+remains the transparent anchor until the gate is tuned on additional held-out
+seasons.
+
+For a model-family ablation, add `--forecast-model ridge`. The expanded ridge
+run reached 2,189 points in its best 2025/26 opening-squad replay (2,113 mean
+across four openings), still 224 points below the target. The direct-horizon
+neural and price-aware variants are retained as inspectable research outputs;
+they are not evidence of a winning strategy by themselves.
 
 ## License
 

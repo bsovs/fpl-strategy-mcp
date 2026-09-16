@@ -440,15 +440,33 @@ def build_model_signal_cache(
     ).fillna(0.0)
     # A double gameweek has one forecast row per fixture, but the simulator
     # needs one decision-time signal per player/GW. Preserve the latest
-    # point-in-time context while summing the fixture-level point forecasts;
-    # silently keeping the last fixture understates Bench Boost and captaincy
+    # point-in-time context while summing fixture-level point forecasts and
+    # averaging direct horizon forecasts, which are repeated per fixture.
+    # Silently keeping the last fixture understates Bench Boost and captaincy
     # value and can change wildcard/Free Hit rankings.
     if frame.duplicated(["gameweek", "player_id"]).any():
         point_totals = frame.groupby(["gameweek", "player_id"], as_index=False)["extended_selected"].sum()
+        horizon_columns = [
+            column
+            for column in ("forecast_short_expected_points", "forecast_long_expected_points")
+            if column in frame
+        ]
+        horizon_totals = (
+            frame.groupby(["gameweek", "player_id"], as_index=False)[horizon_columns].mean()
+            if horizon_columns
+            else None
+        )
         frame = frame.drop_duplicates(["gameweek", "player_id"], keep="last").drop(
             columns=["extended_selected"]
         )
         frame = frame.merge(point_totals, on=["gameweek", "player_id"], how="left", validate="one_to_one")
+        if horizon_totals is not None:
+            frame = frame.drop(columns=horizon_columns).merge(
+                horizon_totals,
+                on=["gameweek", "player_id"],
+                how="left",
+                validate="one_to_one",
+            )
 
     result: dict[int, list[PlayerSignal]] = {}
     for gameweek in sorted(current.snapshots_by_gw):
@@ -472,11 +490,21 @@ def build_model_signal_cache(
             social_sentiment = float(getattr(row, "social_sentiment", 0.0) or 0.0)
             short_fixtures = float(getattr(row, "fixtures_next_3", short_horizon) or short_horizon)
             long_fixtures = float(getattr(row, "fixtures_next_5", long_horizon) or long_horizon)
+            direct_short = getattr(row, "forecast_short_expected_points", None)
+            direct_long = getattr(row, "forecast_long_expected_points", None)
+            if direct_short is not None and pd.notna(direct_short):
+                short_points = max(0.0, float(direct_short))
+            else:
+                short_points = next_points * max(1.0, min(float(short_horizon), short_fixtures))
+            if direct_long is not None and pd.notna(direct_long):
+                long_points = max(0.0, float(direct_long))
+            else:
+                long_points = next_points * max(1.0, min(float(long_horizon), long_fixtures))
             signals.append(
                 PlayerSignal(
                     player_id=player_id,
-                    short_expected_points=next_points * max(1.0, min(float(short_horizon), short_fixtures)),
-                    long_expected_points=next_points * max(1.0, min(float(long_horizon), long_fixtures)),
+                    short_expected_points=short_points,
+                    long_expected_points=long_points,
                     next_expected_points=next_points,
                     short_minutes_probability=float(np.clip(minutes_share, 0.0, 1.0)),
                     long_minutes_probability=float(np.clip(minutes_share, 0.0, 1.0)),

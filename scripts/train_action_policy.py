@@ -64,17 +64,43 @@ def _forecast_caches(
         if not prior_seasons:
             caches[season] = build_signal_cache(current, previous)
             continue
+        print(f"  fitting {forecast_model_kind} point/horizon/price models for {season}", flush=True)
         train = feature_frame[feature_frame["season"].isin(prior_seasons)].copy()
         target = feature_frame[feature_frame["season"] == season].copy()
         if forecast_model_kind == "neural":
             forecast_model = _fit_extended_neural(train)
+            short_model = _fit_extended_neural(
+                train.dropna(subset=["target_horizon_points_3"]),
+                target="target_horizon_points_3",
+            )
+            long_model = _fit_extended_neural(
+                train.dropna(subset=["target_horizon_points_8"]),
+                target="target_horizon_points_8",
+            )
         elif forecast_model_kind == "ridge":
             forecast_model = _fit_extended_ridge(train, alpha=60.0)
+            short_model = _fit_extended_ridge(
+                train.dropna(subset=["target_horizon_points_3"]),
+                alpha=60.0,
+                target="target_horizon_points_3",
+            )
+            long_model = _fit_extended_ridge(
+                train.dropna(subset=["target_horizon_points_8"]),
+                alpha=60.0,
+                target="target_horizon_points_8",
+            )
         else:
             raise ValueError(f"unknown forecast_model_kind: {forecast_model_kind}")
         forecast_rows = target.copy()
         forecast_rows["extended_selected"] = forecast_model.predict(_extended_feature_columns(target))
-        forecast_rows["future_price_change_ridge"] = 0.0
+        forecast_rows["forecast_short_expected_points"] = short_model.predict(_extended_feature_columns(target))
+        forecast_rows["forecast_long_expected_points"] = long_model.predict(_extended_feature_columns(target))
+        price_train = train.dropna(subset=["target_price_change"])
+        if price_train.empty:
+            forecast_rows["future_price_change_ridge"] = 0.0
+        else:
+            price_model = _fit_extended_ridge(price_train, alpha=10.0, target="target_price_change")
+            forecast_rows["future_price_change_ridge"] = price_model.predict(_extended_feature_columns(target))
         caches[season] = build_model_signal_cache(current, forecast_rows)
     return caches
 
@@ -380,7 +406,10 @@ def main() -> None:
         "validation_season": args.validation_season,
         "evaluation_season": args.evaluation_season,
         "target_points": 2413,
-        "feature_cache": f"walk-forward extended {args.forecast_model} forecasts; each season uses only prior seasons for fitting",
+        "feature_cache": (
+            f"walk-forward extended {args.forecast_model} point forecasts, direct 3/8-gameweek forecasts, "
+            "and a next-gameweek price-change ridge; each season uses only prior seasons for fitting"
+        ),
         "development_examples": len(development_examples),
         "validation_examples": len(validation_examples),
         "candidate_validation_scores": validation_scores,

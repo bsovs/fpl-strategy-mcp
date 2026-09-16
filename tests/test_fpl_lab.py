@@ -150,13 +150,28 @@ class FplLabTests(unittest.TestCase):
         current = build_season_data(raw, "2024-25")
         forecasts = pd.DataFrame(
             [
-                {"gameweek": 1, "element": 7, "extended_selected": 4.0},
-                {"gameweek": 1, "element": 7, "extended_selected": 5.0},
+                {"gameweek": 1, "element": 7, "extended_selected": 4.0, "forecast_short_expected_points": 10.0, "forecast_long_expected_points": 20.0},
+                {"gameweek": 1, "element": 7, "extended_selected": 5.0, "forecast_short_expected_points": 11.0, "forecast_long_expected_points": 21.0},
             ]
         )
         cache = build_model_signal_cache(current, forecasts)
         player_signal = next(signal for signal in cache[1] if signal.player_id == "7")
         self.assertEqual(player_signal.next_expected_points, 9.0)
+        self.assertEqual(player_signal.short_expected_points, 10.5)
+        self.assertEqual(player_signal.long_expected_points, 20.5)
+
+    def test_price_label_is_next_gameweek_not_next_double_gameweek_fixture(self):
+        raw = pd.DataFrame(
+            [
+                {"name": "Player", "element": 7, "position": "MID", "team": 1, "opponent_team": 2, "kickoff_time": "2024-08-01T12:00:00Z", "was_home": True, "total_points": 2, "value": 70, "season": "2024-25", "season_order": 2024, "gameweek": 1, "fixture": 1},
+                {"name": "Player", "element": 7, "position": "MID", "team": 1, "opponent_team": 3, "kickoff_time": "2024-08-04T12:00:00Z", "was_home": False, "total_points": 3, "value": 70, "season": "2024-25", "season_order": 2024, "gameweek": 1, "fixture": 2},
+                {"name": "Player", "element": 7, "position": "MID", "team": 1, "opponent_team": 4, "kickoff_time": "2024-08-10T12:00:00Z", "was_home": True, "total_points": 4, "value": 71, "season": "2024-25", "season_order": 2024, "gameweek": 2, "fixture": 3},
+            ]
+        )
+        features = build_extended_player_feature_table(raw)
+        gw1 = features[features["gameweek"] == 1]
+        self.assertEqual(set(gw1["target_price_change"]), {1.0})
+        self.assertEqual(set(gw1["target_horizon_points_3"]), {9.0})
 
     def test_decision_layer_scores_legal_same_position_move(self):
         current = [PlayerState("out", "Out", "MID", "A", 7.0, 6.9)]

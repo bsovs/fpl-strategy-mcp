@@ -78,7 +78,11 @@ history, breakout-vs-career signals, and optional timestamped context. The
 oldest GW files are enriched from season-level `players_raw.csv` metadata;
 those rows carry explicit imputation flags because the roster snapshot is not
 a point-in-time transfer history. All player and team lags are guarded by
-season/gameweek sequence, which blocks double-gameweek result leakage.
+season/gameweek sequence, which blocks double-gameweek result leakage. The
+action bridge additionally trains direct 3- and 8-gameweek point targets and
+a next-gameweek price-change target on distinct player/gameweek rows; a
+double gameweek contributes both fixtures to the point targets but only one
+price label.
 
 On the 2024–25 validation season, the career-feature neural candidate had
 MAE 1.026 while the stronger ridge had RMSE 1.930; the run selected the neural
@@ -165,6 +169,13 @@ player/gameweek signal by summing double-gameweek fixtures. This is required
 for correct Bench Boost, captain, Free Hit, and transfer comparisons; keeping
 only one fixture would understate the value of a double gameweek.
 
+The bridge carries three forecast families into the action state: the
+one-fixture point model, direct short/long horizon models, and a price-change
+ridge. These are deliberately evaluated as ablations rather than blended by
+assumption. Direct horizon values are averaged across duplicated
+double-gameweek rows because they are repeated labels, while fixture-level
+point predictions are summed.
+
 This is still a small benchmark. It is designed to prevent premature claims,
 not to establish a final public leaderboard.
 
@@ -194,6 +205,17 @@ four test opening families; the transparent anchor remains the safer deployed
 fallback while gate tuning is treated as a separate validation-only
 experiment.
 
+Two additional walk-forward ablations make the current boundary clearer. A
+direct-horizon neural bridge plus price model scored 1,914.25 mean points on
+the untouched test, despite a stronger validation action argmax score. A
+ridge point/direct-horizon/price bridge scored 2,113.0 mean and 2,189 in its
+best opening family. The ridge result is the strongest current ablation, but
+it remains 224 points below 2,413 and is based on one held-out season, so it
+is not promoted as the public champion. A separate price-aware neural run
+without direct horizons scored 1,994.25 mean and 2,035 best; price forecasts
+are therefore retained as an available feature, not assumed to improve
+decisions.
+
 The result also illustrates why “the neural network scored more on average” is
 not enough. The action space is path-dependent, chip timing has opportunity
 cost, and model errors compound over a season. A strategy can win a few
@@ -218,10 +240,12 @@ official-bootstrap fallback. The fallback uses official availability, form,
 price, ownership, and transfer fields; it is not a replacement for a trained
 expected-minutes or news model.
 
-Price is treated as an input and a future-state concern. The intended next
-research step is a separate price-change model, evaluated with the same cutoff
-as the points model, whose distribution feeds budget flexibility and transfer
-timing rather than merely adding a static value score.
+Price is treated as an input and a future-state concern. The current
+walk-forward price-change model is wired into the action bridge and evaluated
+with the same cutoff as the points model. Its distribution is intended to feed
+budget flexibility and transfer timing rather than merely add a static value
+score, but the current held-out price-aware ablation did not improve strategy
+replay.
 
 ## 6. Limitations and threats to validity
 
