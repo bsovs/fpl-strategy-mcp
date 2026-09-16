@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fpl-strategy-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "A rules-aware Fantasy Premier League action-policy MCP server"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-remote = ["mcp>=2.0,<3"]
+remote = ["mcp[cli]>=2.0,<3"]
 dev = ["build>=1.2", "pytest>=8", "pyinstaller>=6"]
 
 [project.scripts]
@@ -30,4 +30,3 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 fpl_strategy_mcp = ["assets/*.json", "assets/*.joblib"]
-

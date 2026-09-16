@@ -47,7 +47,7 @@ from fpl_lab.simulator import CHIP_KINDS
 
 
 SERVER_NAME = "fpl-strategy"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.1.1"
 PROTOCOL_VERSION = "2024-11-05"
 PACKAGE_ASSETS = Path(__file__).resolve().parent / "assets"
 DEFAULT_MODEL = ROOT / "assets" / "action-policy-model.joblib"
