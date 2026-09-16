@@ -125,6 +125,42 @@ class MCPServerTests(unittest.TestCase):
         self.assertEqual(plan["bench_boost_increment"], 7.0)
         self.assertIn("Only the starting XI scores normally", plan["note"])
 
+    def test_recommendation_reports_post_transfer_lineup_effect(self):
+        from fpl_lab.decision import DecisionConfig, PlayerSignal, PlayerState
+        from fpl_lab.live_strategy import recommend_live_moves
+
+        positions = ["GK", "GK", *("DEF",) * 5, *("MID",) * 5, *("FWD",) * 3]
+        current = [
+            PlayerState(
+                player_id=f"p{index}",
+                name=f"Player {index}",
+                position=position,
+                team="A",
+                price=5.0,
+            )
+            for index, position in enumerate(positions)
+        ]
+        buyable = [PlayerState("in", "In", "MID", "B", 5.0)]
+        signals = [
+            PlayerSignal(player_id=player.player_id, short_expected_points=1.0, long_expected_points=8.0, next_expected_points=1.0)
+            for player in current
+        ]
+        signals.append(PlayerSignal("in", 5.0, 40.0, next_expected_points=5.0))
+
+        result = recommend_live_moves(
+            current,
+            buyable,
+            signals,
+            DecisionConfig(free_transfers=1),
+            gameweek=1,
+            strategy="champion",
+            limit=1,
+        )
+        move = result["recommended_move"]
+        self.assertEqual(move["player_in_id"], "in")
+        self.assertGreater(move["normal_week_lineup_delta"], 0.0)
+        self.assertIn("starting_ids", move["post_transfer_lineup"])
+
     def test_scenario_backtest_compares_weight_candidates(self):
         from fpl_strategy_mcp.server import _backtest_strategy
 

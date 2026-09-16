@@ -71,6 +71,69 @@ def _lineup_player_row(player: PlayerState, signal: PlayerSignal) -> dict[str, A
     }
 
 
+def _compact_lineup_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    """Keep per-move lineup effects readable without repeating all player rows."""
+
+    return {
+        "formation": plan["formation"],
+        "starting_ids": [row["player_id"] for row in plan["starting_xi"]],
+        "bench_order_ids": [row["player_id"] for row in plan["bench_order"]],
+        "captain_id": plan["captain"]["player_id"],
+        "vice_captain_id": plan["vice_captain"]["player_id"],
+        "projected_total_with_captain": plan["projected_total_with_captain"],
+        "bench_boost_increment": plan["bench_boost_increment"],
+    }
+
+
+def _post_transfer_lineup(
+    current_squad: list[PlayerState],
+    buyable_players: list[PlayerState],
+    signals: list[PlayerSignal],
+    recommendation: TransferRecommendation,
+) -> dict[str, Any]:
+    """Re-optimize the XI after a legal transfer candidate is applied."""
+
+    player_out = next(
+        (player for player in current_squad if player.player_id == recommendation.player_out_id),
+        None,
+    )
+    player_in = next(
+        (player for player in buyable_players if player.player_id == recommendation.player_in_id),
+        None,
+    )
+    if player_out is None or player_in is None:
+        raise ValueError("transfer lineup evaluation could not find both players")
+    after_transfer = [
+        player for player in current_squad if player.player_id != player_out.player_id
+    ]
+    after_transfer.append(replace(player_in, selling_price=player_in.price))
+    return choose_live_lineup(after_transfer, signals)
+
+
+def _transfer_lineup_effect(
+    current_plan: dict[str, Any],
+    current_squad: list[PlayerState],
+    buyable_players: list[PlayerState],
+    signals: list[PlayerSignal],
+    recommendation: TransferRecommendation,
+) -> dict[str, Any]:
+    after = _post_transfer_lineup(current_squad, buyable_players, signals, recommendation)
+    return {
+        "plan": after,
+        "compact_plan": _compact_lineup_plan(after),
+        "normal_week_delta": round(
+            float(after["projected_total_with_captain"])
+            - float(current_plan["projected_total_with_captain"]),
+            3,
+        ),
+        "bench_boost_delta": round(
+            float(after["projected_total_with_bench_boost"])
+            - float(current_plan["projected_total_with_bench_boost"]),
+            3,
+        ),
+    }
+
+
 def choose_live_lineup(
     current_squad: Iterable[PlayerState],
     signals: Iterable[PlayerSignal],
@@ -437,18 +500,50 @@ def recommend_live_moves(
             rank_mode="neutral",
         )
         recommendations = recommend_transfers(current, buyable, signal_rows, champion_config)
-        recommendations = [item for item in recommendations if item.hit_cost <= 0.0][: int(limit)]
+        recommendations = [item for item in recommendations if item.hit_cost <= 0.0]
+        lineup_effects = {
+            _key(item): _transfer_lineup_effect(
+                current_plan=lineup_plan,
+                current_squad=current,
+                buyable_players=buyable,
+                signals=signal_rows,
+                recommendation=item,
+            )
+            for item in recommendations
+        }
+        recommendations.sort(
+            key=lambda item: item.combined_score
+            + champion_config.lineup_weight * lineup_effects[_key(item)]["normal_week_delta"],
+            reverse=True,
+        )
+        recommendations = recommendations[: int(limit)]
         rows = []
         for recommendation in recommendations:
             row = recommendation_to_dict(recommendation)
+            lineup_effect = lineup_effects[_key(recommendation)]
             row.update(
                 {
                     "action": "make_transfer",
                     "decision": "make",
-                    "strategy_score": round(float(np.tanh(recommendation.combined_score / 6.0)), 4),
+                    "strategy_score": round(
+                        float(
+                            np.tanh(
+                                (
+                                    recommendation.combined_score
+                                    + champion_config.lineup_weight
+                                    * lineup_effect["normal_week_delta"]
+                                )
+                                / 6.0
+                            )
+                        ),
+                        4,
+                    ),
                     "model_advantage": None,
                     "model_uncertainty": None,
                     "why": list(recommendation.why),
+                    "normal_week_lineup_delta": lineup_effect["normal_week_delta"],
+                    "bench_boost_lineup_delta": lineup_effect["bench_boost_delta"],
+                    "post_transfer_lineup": lineup_effect["compact_plan"],
                 }
             )
             rows.append(row)
@@ -526,6 +621,16 @@ def recommend_live_moves(
     # preserve diverse same-position options without making a current-week
     # request slow.
     recommendations = recommendations[:120]
+    lineup_effects = {
+        _key(item): _transfer_lineup_effect(
+            current_plan=lineup_plan,
+            current_squad=current,
+            buyable_players=buyable,
+            signals=signal_rows,
+            recommendation=item,
+        )
+        for item in recommendations
+    }
 
     if my_points is None:
         my_points = 0.0
@@ -646,6 +751,10 @@ def recommend_live_moves(
                 continue
         heuristic_score = float(np.tanh(recommendation.combined_score / 6.0))
         model_component = float(np.tanh(model_edge / 6.0)) if model is not None else 0.0
+        lineup_effect = lineup_effects[_key(recommendation)]
+        lineup_overlay = config.lineup_weight * float(
+            np.tanh(lineup_effect["normal_week_delta"] / 6.0)
+        )
         in_signal = signal_by_id[recommendation.player_in_id]
         out_signal = signal_by_id[recommendation.player_out_id]
         leverage = float(in_signal.ownership_leverage - out_signal.ownership_leverage)
@@ -655,6 +764,7 @@ def recommend_live_moves(
             profile.model_weight * model_component
             + (1.0 - profile.model_weight) * heuristic_score
             + game_theory
+            + lineup_overlay
             - profile.risk_penalty * uncertainty
         )
         if score < profile.minimum_score:
@@ -675,6 +785,9 @@ def recommend_live_moves(
                 "behind_factor": round(behind, 4),
                 "action": "make_transfer",
                 "decision": "make",
+                "normal_week_lineup_delta": lineup_effect["normal_week_delta"],
+                "bench_boost_lineup_delta": lineup_effect["bench_boost_delta"],
+                "post_transfer_lineup": lineup_effect["compact_plan"],
             }
         )
         moves.append(row)

@@ -42,7 +42,7 @@ sys.path.insert(0, str(SOURCE_ROOT))
 sys.path.insert(0, str(ROOT))
 
 SERVER_NAME = "fpl-strategy"
-SERVER_VERSION = "0.1.6"
+SERVER_VERSION = "0.1.7"
 PROTOCOL_VERSION = "2024-11-05"
 PACKAGE_ASSETS = Path(__file__).resolve().parent / "assets"
 DEFAULT_MODEL = ROOT / "assets" / "action-policy-model.joblib"
@@ -758,7 +758,7 @@ def _recommend(arguments: dict[str, Any]) -> dict[str, Any]:
         "signals": "one PlayerSignal record for every current and buyable player; optional with auto_official_signals=true",
         "league_context": "optional my_points, leader_points, league_size",
         "chips_available": "optional list of unused chips; chips_used may be supplied instead",
-        "weight_overrides": "optional DecisionConfig fields such as short_weight, long_weight, price_weight, ownership_weight, risk_aversion, and rank_mode",
+        "weight_overrides": "optional DecisionConfig fields such as short_weight, long_weight, lineup_weight, price_weight, ownership_weight, risk_aversion, and rank_mode",
     }
     result["effective_decision_config"] = _decision_config_payload(state["config"])
     result["signal_source"] = state["signal_source"]
@@ -956,6 +956,7 @@ def _strategy_catalog() -> dict[str, Any]:
             "price_weight": "future price/bank-value signal weight",
             "ownership_weight": "rank leverage weight; rank_mode must be chase or defend to activate it",
             "risk_aversion": "penalty on injury, rotation, news, price-change, and model uncertainty",
+            "lineup_weight": "live decision overlay for the projected starting-XI/captain points delta after a transfer",
             "rank_mode": "neutral, chase, or defend",
             "min_move_score": "minimum transfer score before a move is considered",
             "now_threshold": "score threshold for labeling a move now rather than watch",
@@ -1337,7 +1338,7 @@ TOOLS = [
                 "config": {"type": "object"},
                 "weight_overrides": {
                     "type": "object",
-                    "description": "Per-request DecisionConfig overrides, e.g. short_weight, long_weight, price_weight, ownership_weight, risk_aversion, rank_mode.",
+                    "description": "Per-request DecisionConfig overrides, e.g. short_weight, long_weight, lineup_weight, price_weight, ownership_weight, risk_aversion, rank_mode.",
                 },
                 "weights": {"type": "object", "description": "Alias for weight_overrides."},
                 "league_context": {"type": "object"},

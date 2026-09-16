@@ -84,6 +84,7 @@ class DecisionConfig:
     min_move_score: float = 0.15
     now_threshold: float = 0.75
     risk_aversion: float = 1.0
+    lineup_weight: float = 0.35
     price_weight: float = 0.75
     ownership_weight: float = 0.25
     rank_mode: str = "neutral"

@@ -23,7 +23,7 @@ clients, and run a fast health check. Use `--clients claude`,
 `--clients claude-code`, `--clients codex`, or `--clients none` to narrow the
 setup. Existing Claude JSON and Codex TOML are backed up before they are
 changed. Each GitHub release also publishes SHA-256 checksums. To pin a
-version, set `FPL_STRATEGY_VERSION=0.1.6` before running the installer.
+version, set `FPL_STRATEGY_VERSION=0.1.7` before running the installer.
 
 ## Connect a client
 
@@ -85,11 +85,11 @@ loop inspectable and tunable.
 
 | Tool | Purpose |
 | --- | --- |
-| `fpl_recommend_moves` | Return the recommended hold, transfer, or model-backed chip action under FPL legality, prices, short/long forecasts, uncertainty, news, and league context. `buyable_players` is optional; omit it to load the full official player pool. |
+| `fpl_recommend_moves` | Return the recommended hold, transfer, or model-backed chip action under FPL legality, prices, short/long forecasts, projected XI/bench effects, uncertainty, news, and league context. `buyable_players` is optional; omit it to load the full official player pool. |
 | `fpl_lineup_plan` | Choose the legal formation, starting XI, bench order, captain, and vice-captain. Reports the projected four-player Bench Boost increment; normally only the XI scores. |
 | `fpl_search_players` | Search the cached official pool by name, team, position, price, or availability. Useful for inspecting candidates or constructing a smaller request payload. |
 | `fpl_forecast_signals` | Inspect each player’s short/long expected points, future price signals, minutes/role, risk, news/social context, ownership leverage, and uncertainty before making a decision. |
-| `fpl_score_moves` | Rank legal one-transfer moves under explicit `weight_overrides` such as `short_weight`, `long_weight`, `price_weight`, `ownership_weight`, `risk_aversion`, and `rank_mode`. |
+| `fpl_score_moves` | Rank legal one-transfer moves under explicit `weight_overrides` such as `short_weight`, `long_weight`, `lineup_weight`, `price_weight`, `ownership_weight`, `risk_aversion`, and `rank_mode`. |
 | `fpl_strategy_info` | Return the shipped champion, benchmark summaries, research sources, and limitations. |
 | `fpl_strategy_catalog` | Return available strategies, action kinds, default weights/gates, signal components, and the fields that can be tuned. |
 | `fpl_backtest_strategy` | Compare candidate weights on supplied point-in-time scenarios, or replay the legal simulator over Vaastav-format historical GW files. |

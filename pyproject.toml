@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fpl-strategy-mcp"
-version = "0.1.6"
+version = "0.1.7"
 description = "A rules-aware Fantasy Premier League action-policy MCP server"
 readme = "README.md"
 requires-python = ">=3.10"
