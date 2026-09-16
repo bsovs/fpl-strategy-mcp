@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from dataclasses import asdict
 from pathlib import Path
 import re
 import shutil
@@ -41,12 +42,13 @@ sys.path.insert(0, str(SOURCE_ROOT))
 sys.path.insert(0, str(ROOT))
 
 SERVER_NAME = "fpl-strategy"
-SERVER_VERSION = "0.1.4"
+SERVER_VERSION = "0.1.5"
 PROTOCOL_VERSION = "2024-11-05"
 PACKAGE_ASSETS = Path(__file__).resolve().parent / "assets"
 DEFAULT_MODEL = ROOT / "assets" / "action-policy-model.joblib"
 CHAMPION_PATH = ROOT / "assets" / "champion.json"
 _MODEL_CACHE: dict[str, object] = {}
+_BOOTSTRAP_CACHE: dict[str, tuple[dict[str, Any], str]] = {}
 POSITION_BY_ELEMENT_TYPE = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
 
 
@@ -424,7 +426,10 @@ def _load_bootstrap(path_value: str | None, fetch_official: bool) -> tuple[dict[
     from fpl_lab.fpl_api import BOOTSTRAP_URL, fetch_json
 
     if fetch_official:
-        return fetch_json(BOOTSTRAP_URL), BOOTSTRAP_URL
+        cache_key = BOOTSTRAP_URL
+        if cache_key not in _BOOTSTRAP_CACHE:
+            _BOOTSTRAP_CACHE[cache_key] = (fetch_json(BOOTSTRAP_URL), BOOTSTRAP_URL)
+        return _BOOTSTRAP_CACHE[cache_key]
     path = Path(path_value) if path_value else _asset_path("bootstrap-static.snapshot.json")
     if not path.is_absolute():
         path = ROOT / path
@@ -432,7 +437,10 @@ def _load_bootstrap(path_value: str | None, fetch_official: bool) -> tuple[dict[
         raise ValueError(
             f"bootstrap snapshot does not exist: {path}; set fetch_official=true or provide bootstrap_path"
         )
-    return json.loads(path.read_text(encoding="utf-8")), str(path.resolve())
+    cache_key = str(path.resolve())
+    if cache_key not in _BOOTSTRAP_CACHE:
+        _BOOTSTRAP_CACHE[cache_key] = (json.loads(path.read_text(encoding="utf-8")), cache_key)
+    return _BOOTSTRAP_CACHE[cache_key]
 
 
 def _bootstrap_lookup(bootstrap: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
@@ -543,7 +551,7 @@ def _official_signal_rows(
 
 
 def _state_from_arguments(arguments: dict[str, Any]):
-    from fpl_lab.decision import DecisionConfig, PlayerState
+    from fpl_lab.decision import DecisionConfig, PlayerSignal, PlayerState
     from fpl_lab.simulator import CHIP_KINDS
 
     payload = arguments.get("state", arguments)
@@ -552,17 +560,22 @@ def _state_from_arguments(arguments: dict[str, Any]):
     current_rows = payload.get("current_squad") or payload.get("current_team")
     buyable_rows = payload.get("buyable_players") or payload.get("available_players")
     signals_rows = payload.get("signals")
-    if current_rows is None or buyable_rows is None or signals_rows is None:
-        if current_rows is None or buyable_rows is None:
-            raise ValueError(
-                "state requires current_squad/current_team and buyable_players/available_players"
-            )
-        if signals_rows is not None:
-            raise ValueError("signals must be a list when supplied")
+    if current_rows is None:
+        raise ValueError("state requires current_squad or current_team")
+    if not isinstance(current_rows, list):
+        raise ValueError("current_squad/current_team must be a list")
     gameweek = payload.get("gameweek")
     if gameweek is None:
         raise ValueError("gameweek is required")
-    auto_official = bool(payload.get("auto_official_signals", False))
+    # The official bootstrap is the source of truth for the current player
+    # universe. If the caller omits buyable_players, load the full pool rather
+    # than silently narrowing the decision to whatever players were pasted in.
+    pool_was_omitted = buyable_rows is None
+    auto_official = (
+        bool(payload.get("auto_official_signals", False))
+        or pool_was_omitted
+        or signals_rows is None
+    )
     bootstrap = None
     bootstrap_source = None
     if auto_official:
@@ -570,8 +583,23 @@ def _state_from_arguments(arguments: dict[str, Any]):
             payload.get("bootstrap_path"), bool(payload.get("fetch_official", False))
         )
         elements, teams = _bootstrap_lookup(bootstrap)
+        if pool_was_omitted:
+            current_ids = {
+                str(row.get("player_id", row.get("id", "")))
+                for row in current_rows
+                if isinstance(row, dict)
+            }
+            buyable_rows = [
+                {"player_id": player_id}
+                for player_id in elements
+                if player_id not in current_ids
+            ]
         current_rows = [_hydrate_player_row(row, elements, teams) for row in current_rows]
         buyable_rows = [_hydrate_player_row(row, elements, teams) for row in buyable_rows]
+    if buyable_rows is None or not isinstance(buyable_rows, list):
+        raise ValueError(
+            "buyable_players/available_players must be a list, or omit it with official bootstrap data enabled"
+        )
     current = _dataclass_rows(current_rows, PlayerState)
     buyable = _dataclass_rows(buyable_rows, PlayerState)
     if signals_rows is None:
@@ -593,12 +621,45 @@ def _state_from_arguments(arguments: dict[str, Any]):
         signals = _dataclass_rows(signals_rows, PlayerSignal)
         signal_source = "provided"
         state_warnings = []
+        if auto_official and bootstrap is not None:
+            # A caller may provide high-quality signals for a subset while the
+            # official pool supplies the rest. Fill only missing IDs with the
+            # transparent fallback so one omitted player cannot vanish from
+            # the legal action search.
+            fallback = _official_signal_rows(
+                [*current_rows, *buyable_rows],
+                _bootstrap_lookup(bootstrap)[0],
+                int(gameweek),
+            )
+            supplied_ids = {signal.player_id for signal in signals}
+            signals.extend(signal for signal in fallback if signal.player_id not in supplied_ids)
+            signal_source = f"provided+official_bootstrap:{bootstrap_source}"
+            if len(supplied_ids) < len(fallback):
+                state_warnings.append(
+                    "Official bootstrap fallback filled signal rows missing from the supplied signal table."
+                )
+    if pool_was_omitted:
+        state_warnings.append(
+            f"Loaded the full official player pool ({len(buyable)} buyable rows) because buyable_players was omitted."
+        )
     config_payload = payload.get("config", {})
     if not isinstance(config_payload, dict):
         raise ValueError("config must be an object")
+    weight_overrides = payload.get("weight_overrides", payload.get("weights", {}))
+    if not isinstance(weight_overrides, dict):
+        raise ValueError("weight_overrides/weights must be an object when supplied")
     allowed_config = set(DecisionConfig.__dataclass_fields__)
+    unknown_overrides = set(weight_overrides) - allowed_config
+    if unknown_overrides:
+        raise ValueError(f"unknown decision weight/config fields: {sorted(unknown_overrides)}")
+    merged_config = {
+        key: value
+        for key, value in config_payload.items()
+        if key in allowed_config
+    }
+    merged_config.update(weight_overrides)
     config = DecisionConfig(
-        **{key: value for key, value in config_payload.items() if key in allowed_config}
+        **merged_config
     )
     league_context = payload.get("league_context", {})
     if not isinstance(league_context, dict):
@@ -636,6 +697,40 @@ def _state_from_arguments(arguments: dict[str, Any]):
     }
 
 
+def _decision_config_payload(config: Any) -> dict[str, Any]:
+    return asdict(config)
+
+
+def _player_signal_rows(state: dict[str, Any]) -> list[dict[str, Any]]:
+    players = {
+        player.player_id: {
+            "player_id": player.player_id,
+            "name": player.name,
+            "position": player.position,
+            "team": player.team,
+            "price": player.price,
+            "selling_price": player.selling_price,
+            "can_buy": player.can_buy,
+            "in_current_squad": False,
+            "buyable": False,
+        }
+        for player in [*state["current"], *state["buyable"]]
+    }
+    current_ids = {player.player_id for player in state["current"]}
+    buyable_ids = {player.player_id for player in state["buyable"]}
+    for player_id, row in players.items():
+        row["in_current_squad"] = player_id in current_ids
+        row["buyable"] = player_id in buyable_ids
+    signals = {signal.player_id: asdict(signal) for signal in state["signals"]}
+    missing = sorted(set(players) - set(signals))
+    if missing:
+        raise ValueError(f"missing signals for player IDs: {missing[:10]}")
+    return [
+        {**players[player_id], **signals[player_id]}
+        for player_id in sorted(players, key=lambda item: (players[item]["position"], players[item]["name"]))
+    ]
+
+
 def _recommend(arguments: dict[str, Any]) -> dict[str, Any]:
     from fpl_lab.live_strategy import recommend_live_moves
 
@@ -663,11 +758,484 @@ def _recommend(arguments: dict[str, Any]) -> dict[str, Any]:
         "signals": "one PlayerSignal record for every current and buyable player; optional with auto_official_signals=true",
         "league_context": "optional my_points, leader_points, league_size",
         "chips_available": "optional list of unused chips; chips_used may be supplied instead",
+        "weight_overrides": "optional DecisionConfig fields such as short_weight, long_weight, price_weight, ownership_weight, risk_aversion, and rank_mode",
     }
+    result["effective_decision_config"] = _decision_config_payload(state["config"])
     result["signal_source"] = state["signal_source"]
     result["state_warnings"] = state["state_warnings"]
     result.setdefault("warnings", []).extend(state["state_warnings"])
     return result
+
+
+def _forecast_signals(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Expose the point-in-time signal table without making a decision."""
+
+    state = _state_from_arguments(arguments)
+    return {
+        "gameweek": state["gameweek"],
+        "signal_source": state["signal_source"],
+        "decision_config": _decision_config_payload(state["config"]),
+        "players": _player_signal_rows(state),
+        "warnings": state["state_warnings"]
+        + [
+            "These are the supplied or bootstrap-derived ensemble inputs; this tool does not invent future information.",
+            "Use point-in-time news/social records and trained model outputs when tuning or backtesting.",
+        ],
+    }
+
+
+def _search_players(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Search the cached official player pool for candidate construction."""
+
+    bootstrap, source = _load_bootstrap(
+        arguments.get("bootstrap_path"), bool(arguments.get("fetch_official", False))
+    )
+    elements, teams = _bootstrap_lookup(bootstrap)
+    query = str(arguments.get("query", "")).strip().lower()
+    position = str(arguments.get("position", "")).strip().upper()
+    if position == "GK":
+        position = "GKP"
+    team_query = str(arguments.get("team", "")).strip().lower()
+    min_price = arguments.get("min_price")
+    max_price = arguments.get("max_price")
+    available_only = bool(arguments.get("available_only", False))
+    limit = max(1, min(200, int(arguments.get("limit", 50))))
+    rows = []
+    for player_id, element in elements.items():
+        team_id = str(element.get("team", ""))
+        team_name = teams.get(team_id, team_id)
+        player_position = POSITION_BY_ELEMENT_TYPE.get(int(element.get("element_type", 0)), "")
+        price = _number(element.get("now_cost")) / 10.0
+        name = str(element.get("web_name") or "")
+        haystack = f"{name} {element.get('first_name', '')} {element.get('second_name', '')} {team_name}".lower()
+        if query and query not in haystack and query != player_id:
+            continue
+        if position and player_position != position:
+            continue
+        if team_query and team_query not in team_name.lower() and team_query != team_id:
+            continue
+        if min_price is not None and price < float(min_price):
+            continue
+        if max_price is not None and price > float(max_price):
+            continue
+        can_buy = bool(element.get("can_transact", True) and element.get("can_select", True))
+        if available_only and not can_buy:
+            continue
+        rows.append(
+            {
+                "player_id": player_id,
+                "name": name,
+                "position": player_position,
+                "team_id": team_id,
+                "team": team_name,
+                "price": price,
+                "status": str(element.get("status", "")),
+                "can_buy": can_buy,
+                "news": str(element.get("news", "")),
+                "form": _number(element.get("form")),
+                "ep_next": _number(element.get("ep_next")),
+                "ep_this": _number(element.get("ep_this")),
+                "points_per_game": _number(element.get("points_per_game")),
+                "selected_by_percent": _number(element.get("selected_by_percent")),
+                "chance_of_playing_next_round": element.get("chance_of_playing_next_round"),
+                "total_points": _number(element.get("total_points")),
+                "value_season": _number(element.get("value_season")),
+                "transfers_in_event": _number(element.get("transfers_in_event")),
+                "transfers_out_event": _number(element.get("transfers_out_event")),
+                "cost_change_event": _number(element.get("cost_change_event")),
+                "cost_change_start": _number(element.get("cost_change_start")),
+            }
+        )
+    rows.sort(key=lambda row: (-row["total_points"], -row["points_per_game"], row["name"]))
+    return {
+        "source": source,
+        "pool_size": len(elements),
+        "matched": len(rows),
+        "filters": {
+            "query": query or None,
+            "position": position or None,
+            "team": team_query or None,
+            "min_price": min_price,
+            "max_price": max_price,
+            "available_only": available_only,
+        },
+        "players": rows[:limit],
+        "truncated": len(rows) > limit,
+    }
+
+
+def _score_moves(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Rank legal one-transfer moves under explicit user-supplied weights."""
+
+    from fpl_lab.decision import recommendation_to_dict, recommend_transfers
+
+    state = _state_from_arguments(arguments)
+    if len(state["current"]) != 15:
+        raise ValueError(f"current_squad must contain exactly 15 players; received {len(state['current'])}")
+    recommendations = recommend_transfers(
+        state["current"], state["buyable"], state["signals"], state["config"]
+    )
+    actions = [
+        {
+            "action": "hold",
+            "decision": "hold",
+            "combined_score": 0.0,
+            "why": ["hold is the zero-cost baseline for this transfer-only scorecard"],
+        }
+    ]
+    for recommendation in recommendations[: int(state["limit"])]:
+        row = recommendation_to_dict(recommendation)
+        row.update({"action": "make_transfer", "decision": "make"})
+        actions.append(row)
+    best = actions[1] if len(actions) > 1 and actions[1]["combined_score"] > 0 else actions[0]
+    return {
+        "gameweek": state["gameweek"],
+        "action": best["action"],
+        "recommended_move": best if best["action"] != "hold" else None,
+        "actions": actions,
+        "legal_move_count": len(recommendations),
+        "effective_decision_config": _decision_config_payload(state["config"]),
+        "signal_source": state["signal_source"],
+        "warnings": state["state_warnings"]
+        + [
+            "This scorecard tunes the transparent transfer layer only; chip actions remain in fpl_recommend_moves and the action-value model.",
+        ],
+    }
+
+
+def _strategy_catalog() -> dict[str, Any]:
+    from fpl_lab.decision import DecisionConfig
+    from fpl_lab.league import HYBRID_PROFILES
+    from fpl_lab.policy import ACTION_KINDS, CocktailConfig
+
+    return {
+        "server": SERVER_NAME,
+        "version": SERVER_VERSION,
+        "primary_tool": "fpl_recommend_moves",
+        "strategies": {
+            "champion": {
+                "description": "Frozen points-first, free-transfer anchor selected by the temporal tournament.",
+                "uses_action_model": False,
+                "allows_paid_hits": False,
+                "allows_chips": False,
+            },
+            **{
+                name: {
+                    **asdict(profile),
+                    "description": f"Hybrid challenger profile: {name.replace('_', ' ')}.",
+                    "uses_action_model": True,
+                }
+                for name, profile in HYBRID_PROFILES.items()
+            },
+        },
+        "action_kinds": list(ACTION_KINDS),
+        "default_decision_config": asdict(DecisionConfig()),
+        "default_cocktail_config": asdict(CocktailConfig()),
+        "tunable_fields": {
+            "short_weight": "relative emphasis on the next few gameweeks",
+            "long_weight": "relative emphasis on the medium-term horizon",
+            "price_weight": "future price/bank-value signal weight",
+            "ownership_weight": "rank leverage weight; rank_mode must be chase or defend to activate it",
+            "risk_aversion": "penalty on injury, rotation, news, price-change, and model uncertainty",
+            "rank_mode": "neutral, chase, or defend",
+            "min_move_score": "minimum transfer score before a move is considered",
+            "now_threshold": "score threshold for labeling a move now rather than watch",
+            "free_transfers": "current free transfers available",
+            "bank": "current bank in millions",
+            "weight_overrides": "the same fields can be passed per request without changing the installed model",
+            "cocktail_config": "action-model gates and model/risk blending for historical simulator backtests",
+        },
+        "signal_components": {
+            "points": "short_expected_points, long_expected_points, next_expected_points",
+            "price": "short_price_signal, long_price_signal, price_change_risk",
+            "availability": "short_minutes_probability, long_minutes_probability, role_security, injury_risk, rotation_risk",
+            "context": "news_risk, news_sentiment, social_sentiment, context_reliability, context_event_count",
+            "game_theory": "ownership_leverage and league_context",
+            "uncertainty": "uncertainty from the underlying forecast ensemble",
+        },
+        "model_components": [
+            {
+                "name": "historical_rolling_points",
+                "role": "Leakage-safe short/long player-point baseline built from prior gameweeks and fixture counts.",
+                "runtime_field": "short_expected_points / long_expected_points",
+            },
+            {
+                "name": "price_economics",
+                "role": "Short/long future-price and bank-value signals, including selling-price constraints.",
+                "runtime_field": "short_price_signal / long_price_signal / price_change_risk",
+            },
+            {
+                "name": "availability_and_role",
+                "role": "Expected minutes, role security, injury and rotation risk.",
+                "runtime_field": "short_minutes_probability / role_security / injury_risk / rotation_risk",
+            },
+            {
+                "name": "news_and_social_context",
+                "role": "As-of official/team news and social context adjustments when supplied by the caller/context pipeline.",
+                "runtime_field": "news_risk / news_sentiment / social_sentiment / context_reliability",
+            },
+            {
+                "name": "action_value_policy",
+                "role": "Neural/ensemble value of legal actions after points, prices, hits, chips, and rank state are combined.",
+                "runtime_field": "model_advantage / model_uncertainty",
+            },
+        ],
+        "backtest_contracts": {
+            "scenario_replay": "Pass point-in-time states plus realized action_outcomes to tune decision weights without future leakage.",
+            "season_simulator": "Pass history_root and season to replay the legal FPL simulator over Vaastav-format GW CSVs.",
+        },
+    }
+
+
+def _load_scenarios(arguments: dict[str, Any]) -> list[dict[str, Any]]:
+    scenarios = arguments.get("scenarios")
+    path_value = arguments.get("scenarios_path")
+    if scenarios is None and path_value:
+        path = Path(str(path_value)).expanduser()
+        if not path.is_absolute():
+            path = ROOT / path
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        scenarios = payload.get("scenarios") if isinstance(payload, dict) else payload
+    if not isinstance(scenarios, list) or not scenarios:
+        raise ValueError("backtest requires a non-empty scenarios list or scenarios_path")
+    if not all(isinstance(row, dict) for row in scenarios):
+        raise ValueError("every backtest scenario must be an object")
+    return scenarios
+
+
+def _candidate_config(candidate: dict[str, Any], base_config: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base_config)
+    nested = candidate.get("config", {})
+    if not isinstance(nested, dict):
+        raise ValueError("backtest candidate config must be an object")
+    merged.update(nested)
+    weights = candidate.get("weights", candidate.get("weight_overrides", {}))
+    if not isinstance(weights, dict):
+        raise ValueError("backtest candidate weights must be an object")
+    merged.update(weights)
+    return merged
+
+
+def _outcome_payload(value: Any) -> dict[str, Any]:
+    if isinstance(value, (int, float)):
+        return {"net_points": float(value)}
+    if not isinstance(value, dict):
+        raise ValueError("each action outcome must be a number or object")
+    return value
+
+
+def _outcome_utility(outcome: dict[str, Any], objective: str) -> float:
+    if objective == "net_points":
+        value = outcome.get("net_points", outcome.get("points"))
+    elif objective == "rank_utility":
+        value = outcome.get("rank_utility")
+    elif objective == "composite":
+        value = (
+            outcome.get("net_points", outcome.get("points", 0.0))
+            + 0.15 * outcome.get("squad_value_delta", 0.0)
+            + outcome.get("rank_utility", 0.0)
+        )
+    else:
+        raise ValueError("objective must be net_points, rank_utility, or composite")
+    if value is None:
+        raise ValueError(f"action outcome is missing the field required for objective={objective}")
+    return float(value)
+
+
+def _find_outcome(outcomes: dict[str, Any], action_key: str) -> dict[str, Any]:
+    aliases = [action_key]
+    if action_key.startswith("transfer:"):
+        aliases.append(action_key.removeprefix("transfer:"))
+    for alias in aliases:
+        if alias in outcomes:
+            return _outcome_payload(outcomes[alias])
+    raise ValueError(
+        f"scenario is missing realized outcome for selected action {action_key!r}; "
+        f"available keys: {sorted(outcomes)[:12]}"
+    )
+
+
+def _scenario_backtest(arguments: dict[str, Any]) -> dict[str, Any]:
+    from fpl_lab.decision import recommend_transfers
+
+    scenarios = _load_scenarios(arguments)
+    objective = str(arguments.get("objective", "net_points"))
+    base_config = arguments.get("base_config", {})
+    if not isinstance(base_config, dict):
+        raise ValueError("base_config must be an object")
+    candidates = arguments.get("candidates") or [{"name": "provided_config", "config": {}}]
+    if not isinstance(candidates, list) or not candidates:
+        raise ValueError("candidates must be a non-empty list")
+    results = []
+    for index, raw_candidate in enumerate(candidates):
+        if not isinstance(raw_candidate, dict):
+            raise ValueError("each backtest candidate must be an object")
+        name = str(raw_candidate.get("name", f"candidate_{index + 1}"))
+        details = []
+        action_counts: dict[str, int] = {}
+        utility_values = []
+        net_points = []
+        regrets = []
+        for scenario_index, scenario in enumerate(scenarios):
+            payload = dict(scenario.get("state", scenario))
+            scenario_config = payload.get("config", {})
+            if not isinstance(scenario_config, dict):
+                raise ValueError(f"scenario {scenario_index} config must be an object")
+            payload["config"] = _candidate_config(raw_candidate, {**base_config, **scenario_config})
+            state = _state_from_arguments(payload)
+            recommendations = recommend_transfers(
+                state["current"], state["buyable"], state["signals"], state["config"]
+            )
+            if recommendations and recommendations[0].combined_score > 0.0:
+                recommendation = recommendations[0]
+                action_key = f"transfer:{recommendation.player_out_id}>{recommendation.player_in_id}"
+                predicted_score = recommendation.combined_score
+            else:
+                action_key = "hold"
+                predicted_score = 0.0
+            outcomes = scenario.get("action_outcomes")
+            if not isinstance(outcomes, dict):
+                raise ValueError(f"scenario {scenario_index} requires an action_outcomes object")
+            chosen_outcome = _find_outcome(outcomes, action_key)
+            chosen_utility = _outcome_utility(chosen_outcome, objective)
+            oracle_utility = max(
+                _outcome_utility(_outcome_payload(value), objective)
+                for value in outcomes.values()
+            )
+            action_counts[action_key] = action_counts.get(action_key, 0) + 1
+            utility_values.append(chosen_utility)
+            net_points.append(float(chosen_outcome.get("net_points", chosen_outcome.get("points", 0.0))))
+            regrets.append(oracle_utility - chosen_utility)
+            if bool(arguments.get("include_details", True)):
+                details.append(
+                    {
+                        "scenario": scenario.get("id", scenario_index),
+                        "gameweek": state["gameweek"],
+                        "action": action_key,
+                        "predicted_score": round(float(predicted_score), 4),
+                        "realized_utility": round(float(chosen_utility), 4),
+                        "realized_net_points": round(float(net_points[-1]), 4),
+                        "oracle_utility": round(float(oracle_utility), 4),
+                        "regret": round(float(regrets[-1]), 4),
+                    }
+                )
+        results.append(
+            {
+                "name": name,
+                "config": _candidate_config(raw_candidate, base_config),
+                "scenarios": len(utility_values),
+                "mean_utility": round(float(sum(utility_values) / len(utility_values)), 4),
+                "total_utility": round(float(sum(utility_values)), 4),
+                "mean_net_points": round(float(sum(net_points) / len(net_points)), 4),
+                "hold_rate": round(float(action_counts.get("hold", 0) / len(utility_values)), 4),
+                "mean_regret_to_oracle": round(float(sum(regrets) / len(regrets)), 4),
+                "action_counts": action_counts,
+                "details": details,
+            }
+        )
+    results.sort(key=lambda row: (row["mean_utility"], -row["mean_regret_to_oracle"]), reverse=True)
+    return {
+        "kind": "scenario_replay",
+        "objective": objective,
+        "candidate_count": len(results),
+        "scenario_count": len(scenarios),
+        "winner": results[0]["name"],
+        "results": results,
+        "warnings": [
+            "This replay is only as honest as the supplied point-in-time signals and realized action outcomes.",
+            "Do not tune candidates and report the same season as an untouched test result; reserve a final season and starting squads.",
+        ],
+    }
+
+
+def _season_backtest(arguments: dict[str, Any]) -> dict[str, Any]:
+    from fpl_lab.player_models import load_vaastav_gameweeks
+    from fpl_lab.simulator import build_season_data, build_signal_cache, simulate_season
+    from fpl_lab.policy import CocktailConfig
+
+    history_root = arguments.get("history_root")
+    season = arguments.get("season")
+    if not history_root or not season:
+        raise ValueError("season backtest requires history_root and season")
+    previous_season = arguments.get("previous_season")
+    seasons = [str(season)] + ([str(previous_season)] if previous_season else [])
+    raw = load_vaastav_gameweeks(history_root, seasons)
+    current = build_season_data(raw, str(season))
+    previous = build_season_data(raw, str(previous_season)) if previous_season else None
+    signal_cache = build_signal_cache(current, previous)
+    candidates = arguments.get("candidates") or [{"name": str(arguments.get("policy", "points_only_free_only"))}]
+    if not isinstance(candidates, list) or not candidates:
+        raise ValueError("candidates must be a non-empty list")
+    rows = []
+    for index, raw_candidate in enumerate(candidates):
+        if not isinstance(raw_candidate, dict):
+            raise ValueError("each season backtest candidate must be an object")
+        policy = str(raw_candidate.get("policy", arguments.get("policy", "points_only_free_only")))
+        model = None
+        if policy in {"neural", "cocktail"}:
+            model, model_path, model_error = _load_model(raw_candidate.get("model_path", arguments.get("model_path")))
+            if model is None:
+                raise ValueError(model_error or "action-value model could not be loaded")
+        cocktail_payload = raw_candidate.get("cocktail_config", arguments.get("cocktail_config", {}))
+        if not isinstance(cocktail_payload, dict):
+            raise ValueError("cocktail_config must be an object")
+        cocktail_config = CocktailConfig(
+            **{key: value for key, value in cocktail_payload.items() if key in CocktailConfig.__dataclass_fields__}
+        )
+        modes = raw_candidate.get("initial_squad_modes", arguments.get("initial_squad_modes", ["points"]))
+        if not isinstance(modes, list) or not modes:
+            raise ValueError("initial_squad_modes must be a non-empty list")
+        for mode_index, mode in enumerate(modes):
+            result = simulate_season(
+                current,
+                previous,
+                policy=policy,
+                initial_squad_mode=str(mode),
+                initial_squad_seed=int(arguments.get("seed", 0)) + mode_index,
+                signal_cache=signal_cache,
+                neural_policy=model,
+                start_gameweek=int(arguments.get("start_gameweek", 1)),
+                end_gameweek=arguments.get("end_gameweek"),
+                initial_free_transfers=int(arguments.get("initial_free_transfers", 0)),
+                cocktail_config=cocktail_config,
+            )
+            rows.append(
+                {
+                    "candidate": str(raw_candidate.get("name", f"candidate_{index + 1}")),
+                    "policy": policy,
+                    "initial_squad_mode": str(mode),
+                    "season": result.season,
+                    "gross_points": result.gross_points,
+                    "hit_points": result.hit_points,
+                    "net_points": result.net_points,
+                    "transfers": result.transfers,
+                    "paid_transfers": result.paid_transfers,
+                    "final_bank": result.final_bank,
+                    "final_squad_value": result.final_squad_value,
+                    "gameweeks": result.gameweeks,
+                    "chip_uses": result.chip_uses,
+                    "chips_remaining": list(result.chips_remaining),
+                }
+            )
+    rows.sort(key=lambda row: row["net_points"], reverse=True)
+    return {
+        "kind": "season_simulator",
+        "season": str(season),
+        "history_root": str(history_root),
+        "player_snapshot_gameweeks": len(current.snapshots_by_gw),
+        "results": rows,
+        "warnings": [
+            "This is a historical simulator, not a guarantee of future performance.",
+            "Use separate development and final test seasons/starting squads when tuning cocktail_config.",
+            "Vaastav-format data is expected to be point-in-time player GW history; context/news ingestion is not inferred from future rows.",
+        ],
+    }
+
+
+def _backtest_strategy(arguments: dict[str, Any]) -> dict[str, Any]:
+    if arguments.get("history_root") or arguments.get("season"):
+        return _season_backtest(arguments)
+    return _scenario_backtest(arguments)
 
 
 def _strategy_info() -> dict[str, Any]:
@@ -722,11 +1290,14 @@ TOOLS = [
         "description": (
             "Return legal FPL transfer moves for the current gameweek using the "
             "frozen champion strategy by default. Give a full 15-player "
-            "current squad, buyable players, point-in-time signals or enable "
-            "auto_official_signals, bank/free transfers, unused chips, and optional "
-            "mini-league standings context. The default champion ranks hold and "
+            "current squad. buyable_players is optional: when omitted, the server "
+            "loads the full current official player pool from the cached bootstrap "
+            "snapshot/API. Give point-in-time signals or enable auto_official_signals, "
+            "bank/free transfers, unused chips, and optional mini-league standings "
+            "context. The default champion ranks hold and "
             "legal free transfers; explicit hybrid challengers can rank Wildcard, "
-            "Free Hit, Bench Boost, and Triple Captain when model-backed."
+            "Free Hit, Bench Boost, and Triple Captain when model-backed. Use "
+            "weight_overrides to tune the transparent decision layer per request."
         ),
         "inputSchema": {
             "type": "object",
@@ -738,9 +1309,18 @@ TOOLS = [
                     "default": "champion",
                 },
                 "current_squad": {"type": "array", "items": {"type": "object"}},
-                "buyable_players": {"type": "array", "items": {"type": "object"}},
+                "buyable_players": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Optional. Omit to load every player from the official bootstrap pool.",
+                },
                 "signals": {"type": "array", "items": {"type": "object"}},
                 "config": {"type": "object"},
+                "weight_overrides": {
+                    "type": "object",
+                    "description": "Per-request DecisionConfig overrides, e.g. short_weight, long_weight, price_weight, ownership_weight, risk_aversion, rank_mode.",
+                },
+                "weights": {"type": "object", "description": "Alias for weight_overrides."},
                 "league_context": {"type": "object"},
                 "chips_available": {
                     "type": "array",
@@ -754,8 +1334,8 @@ TOOLS = [
                 },
                 "auto_official_signals": {
                     "type": "boolean",
-                    "default": False,
-                    "description": "If true, signals may be omitted and are built from a local bootstrap snapshot or the official API.",
+                    "default": True,
+                    "description": "If true, omitted signals are built from a local bootstrap snapshot or the official API. The server also falls back automatically when signals are omitted.",
                 },
                 "bootstrap_path": {"type": "string"},
                 "fetch_official": {
@@ -766,13 +1346,100 @@ TOOLS = [
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
                 "model_path": {"type": "string"},
             },
-            "required": ["gameweek", "current_squad", "buyable_players", "config"],
+            "required": ["gameweek", "current_squad"],
+        },
+    },
+    {
+        "name": "fpl_search_players",
+        "description": "Search the full cached official FPL player pool by name, position, team, price, and availability. Use this to construct or inspect buyable candidates; it returns current price, official expected points, form, ownership, status, and transfer signals.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Name, player ID, or team text."},
+                "position": {"type": "string", "enum": ["GKP", "DEF", "MID", "FWD"]},
+                "team": {"type": "string", "description": "Team ID or team name fragment."},
+                "min_price": {"type": "number"},
+                "max_price": {"type": "number"},
+                "available_only": {"type": "boolean", "default": False},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
+                "bootstrap_path": {"type": "string"},
+                "fetch_official": {"type": "boolean", "default": False},
+            },
+        },
+    },
+    {
+        "name": "fpl_forecast_signals",
+        "description": "Return the point-in-time signal table for the supplied squad and buyable pool, including short/long expected points, future price signals, minutes, risk, news/social context, ownership leverage, and uncertainty. Use it to inspect the underlying inputs before asking for a decision.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "gameweek": {"type": "integer", "minimum": 1, "maximum": 38},
+                "current_squad": {"type": "array", "items": {"type": "object"}},
+                "buyable_players": {"type": "array", "items": {"type": "object"}, "description": "Optional; omit to include the full official pool."},
+                "signals": {"type": "array", "items": {"type": "object"}},
+                "auto_official_signals": {"type": "boolean", "default": True},
+                "bootstrap_path": {"type": "string"},
+                "fetch_official": {"type": "boolean", "default": False},
+                "config": {"type": "object"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+            },
+            "required": ["gameweek", "current_squad"],
+        },
+    },
+    {
+        "name": "fpl_score_moves",
+        "description": "Rank legal one-transfer moves under explicit transparent weights. This is the tuning and explanation tool for short/long points, price economics, ownership leverage, availability, news risk, uncertainty, hit cost, and risk aversion; use fpl_recommend_moves for the final action including chips and the learned policy.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "gameweek": {"type": "integer", "minimum": 1, "maximum": 38},
+                "current_squad": {"type": "array", "items": {"type": "object"}},
+                "buyable_players": {"type": "array", "items": {"type": "object"}, "description": "Optional; omit to load the full official pool."},
+                "signals": {"type": "array", "items": {"type": "object"}},
+                "config": {"type": "object"},
+                "weight_overrides": {"type": "object"},
+                "auto_official_signals": {"type": "boolean", "default": True},
+                "bootstrap_path": {"type": "string"},
+                "fetch_official": {"type": "boolean", "default": False},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+            },
+            "required": ["gameweek", "current_squad"],
         },
     },
     {
         "name": "fpl_strategy_info",
         "description": "Return the selected strategy, benchmark status, research sources, and known limitations.",
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "fpl_strategy_catalog",
+        "description": "Return all available strategy profiles, action kinds, default decision/cocktail configs, signal components, and the fields that can be tuned per request or in a backtest.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "fpl_backtest_strategy",
+        "description": "Backtest and compare tunable strategies. Use scenarios/scenarios_path for point-in-time replay with realized action_outcomes, or history_root plus season for the legal Vaastav-format season simulator. Returns mean utility, points, hold rate, regret to the supplied oracle, action counts, and per-scenario details.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "scenarios": {"type": "array", "items": {"type": "object"}},
+                "scenarios_path": {"type": "string"},
+                "candidates": {"type": "array", "items": {"type": "object"}},
+                "base_config": {"type": "object"},
+                "objective": {"type": "string", "enum": ["net_points", "rank_utility", "composite"], "default": "net_points"},
+                "include_details": {"type": "boolean", "default": True},
+                "history_root": {"type": "string", "description": "Root of Vaastav-format season folders when running the full simulator."},
+                "season": {"type": "string"},
+                "previous_season": {"type": "string"},
+                "policy": {"type": "string", "enum": ["hold", "points_only", "points_only_free_only", "price_aware", "chase", "neural", "cocktail"]},
+                "initial_squad_modes": {"type": "array", "items": {"type": "string", "enum": ["points", "value", "template", "randomized_points"]}},
+                "cocktail_config": {"type": "object"},
+                "start_gameweek": {"type": "integer", "minimum": 1, "maximum": 38},
+                "end_gameweek": {"type": "integer", "minimum": 1, "maximum": 38},
+                "seed": {"type": "integer", "default": 0},
+                "model_path": {"type": "string"},
+            },
+        },
     },
 ]
 
@@ -798,7 +1465,7 @@ def _dispatch(request: dict[str, Any]) -> dict[str, Any] | None:
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-                "instructions": "Use fpl_recommend_moves with a current 15-player squad, point-in-time signals, and unused chips when known.",
+                "instructions": "Use fpl_recommend_moves with a current 15-player squad; buyable_players and signals are optional because the server can load the full official pool. Use fpl_strategy_catalog and fpl_backtest_strategy to inspect and tune strategies.",
             },
         }
     if method == "ping":
@@ -816,8 +1483,18 @@ def _dispatch(request: dict[str, Any]) -> dict[str, Any] | None:
         try:
             if name == "fpl_recommend_moves":
                 payload = _recommend(arguments)
+            elif name == "fpl_search_players":
+                payload = _search_players(arguments)
+            elif name == "fpl_forecast_signals":
+                payload = _forecast_signals(arguments)
+            elif name == "fpl_score_moves":
+                payload = _score_moves(arguments)
             elif name == "fpl_strategy_info":
                 payload = _strategy_info()
+            elif name == "fpl_strategy_catalog":
+                payload = _strategy_catalog()
+            elif name == "fpl_backtest_strategy":
+                payload = _backtest_strategy(arguments)
             else:
                 raise ValueError(f"unknown tool: {name}")
             return {"jsonrpc": "2.0", "id": request_id, "result": _tool_result(payload)}

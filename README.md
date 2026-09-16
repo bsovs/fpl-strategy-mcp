@@ -23,7 +23,7 @@ clients, and run a fast health check. Use `--clients claude`,
 `--clients claude-code`, `--clients codex`, or `--clients none` to narrow the
 setup. Existing Claude JSON and Codex TOML are backed up before they are
 changed. Each GitHub release also publishes SHA-256 checksums. To pin a
-version, set `FPL_STRATEGY_VERSION=0.1.4` before running the installer.
+version, set `FPL_STRATEGY_VERSION=0.1.5` before running the installer.
 
 ## Connect a client
 
@@ -77,9 +77,45 @@ Expose `http://127.0.0.1:8000/mcp` through an HTTPS tunnel or authenticated reve
 For HTTP mode, `http://127.0.0.1:8000/health` returns a JSON readiness report
 and is protected by `FPL_MCP_BEARER_TOKEN` when that variable is set.
 
+## MCP tools
+
+The server exposes these tools. `fpl_recommend_moves` is the primary decision
+tool; the others make the forecasts, weights, player universe, and evaluation
+loop inspectable and tunable.
+
+| Tool | Purpose |
+| --- | --- |
+| `fpl_recommend_moves` | Return the recommended hold, transfer, or model-backed chip action under FPL legality, prices, short/long forecasts, uncertainty, news, and league context. `buyable_players` is optional; omit it to load the full official player pool. |
+| `fpl_search_players` | Search the cached official pool by name, team, position, price, or availability. Useful for inspecting candidates or constructing a smaller request payload. |
+| `fpl_forecast_signals` | Inspect each player’s short/long expected points, future price signals, minutes/role, risk, news/social context, ownership leverage, and uncertainty before making a decision. |
+| `fpl_score_moves` | Rank legal one-transfer moves under explicit `weight_overrides` such as `short_weight`, `long_weight`, `price_weight`, `ownership_weight`, `risk_aversion`, and `rank_mode`. |
+| `fpl_strategy_info` | Return the shipped champion, benchmark summaries, research sources, and limitations. |
+| `fpl_strategy_catalog` | Return available strategies, action kinds, default weights/gates, signal components, and the fields that can be tuned. |
+| `fpl_backtest_strategy` | Compare candidate weights on supplied point-in-time scenarios, or replay the legal simulator over Vaastav-format historical GW files. |
+
+For a normal recommendation, provide `gameweek` and the exact 15-player
+`current_squad`. You can provide `buyable_players` and trained `signals`, or
+set `auto_official_signals: true` and let the server load the current official
+bootstrap pool and transparent fallback signals. Per-request weight changes go
+under `weight_overrides` (also accepted as `weights`); they do not modify the
+bundled model or the shipped champion.
+
 ## Input
 
-Call `fpl_recommend_moves` with `gameweek`, `current_squad`, `buyable_players`, `config`, and either point-in-time `signals` or `auto_official_signals: true`. Add `league_context` when rank/leader information should influence risk. Call `fpl_strategy_info` to inspect the served champion and benchmark status.
+Call `fpl_recommend_moves` with `gameweek` and `current_squad`, optionally
+adding `buyable_players`, `config`, `weight_overrides`, and either point-in-time
+`signals` or `auto_official_signals: true`. If `buyable_players` or `signals`
+are omitted, the same official fallback is used automatically. Add
+`league_context` when rank/leader information should influence risk. Call `fpl_strategy_info` or
+`fpl_strategy_catalog` to inspect the served strategy and tuning contract.
+
+`fpl_backtest_strategy` accepts either:
+
+- `scenarios` or `scenarios_path`: point-in-time states with realized
+  `action_outcomes` such as `hold` and `transfer:out_id>in_id`; or
+- `history_root` and `season`: a full legal replay using Vaastav-format
+  `season/gws/gw*.csv` files. Use separate development and held-out seasons and
+  starting-squad modes when tuning.
 
 See [`examples/`](examples/) for client configuration and a protocol smoke test. The official FPL bootstrap endpoint is used only when requested: `https://fantasy.premierleague.com/api/bootstrap-static/`.
 
