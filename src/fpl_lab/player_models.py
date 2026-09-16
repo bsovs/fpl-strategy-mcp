@@ -437,6 +437,44 @@ def _add_context_features(frame: pd.DataFrame, context_store: object | None) -> 
         frame[column] = context_frame[column].astype(float)
 
 
+PLAYER_GAMEWEEK_LAST_COLUMNS = frozenset(
+    {"value", "selected", "transfers_in", "transfers_out", "transfers_balance"}
+)
+
+
+def _build_player_gameweek_summary(frame: pd.DataFrame) -> pd.DataFrame:
+    """Collapse fixture rows to the information known at one player/GW cutoff."""
+
+    keys = ["player_key", "player_season_key", "season", "season_order", "gameweek", "sequence"]
+    ordered = frame.sort_values(["player_key", "season_order", "gameweek", "kickoff_time"])
+    aggregations = {
+        column: ("last" if column in PLAYER_GAMEWEEK_LAST_COLUMNS else "sum")
+        for column in EXTENDED_SOURCE_FEATURES
+    }
+    summary = ordered.groupby(keys, as_index=False, sort=False).agg(aggregations)
+    return summary.sort_values(["player_key", "season_order", "gameweek"]).reset_index(drop=True)
+
+
+def _broadcast_player_gameweek_features(
+    frame: pd.DataFrame,
+    summary: pd.DataFrame,
+    columns: Iterable[str],
+) -> pd.DataFrame:
+    """Broadcast distinct player/GW features to every fixture row in that GW."""
+
+    columns = list(columns)
+    if not columns:
+        return frame
+    lookup = summary.set_index(["player_season_key", "sequence"])[columns]
+    keys = pd.MultiIndex.from_frame(frame[["player_season_key", "sequence"]])
+    values = lookup.reindex(keys)
+    values.index = frame.index
+    overlapping = [column for column in columns if column in frame.columns]
+    if overlapping:
+        frame = frame.drop(columns=overlapping)
+    return pd.concat([frame, values], axis=1)
+
+
 def build_extended_player_feature_table(
     raw: pd.DataFrame,
     context_store: object | None = None,
@@ -454,12 +492,17 @@ def build_extended_player_feature_table(
     for column in ("metadata_team_imputed", "metadata_position_imputed"):
         if column not in frame:
             frame[column] = 0.0
+    frame["player_season_key"] = frame["player_key"].astype(str) + "|" + frame["season"].astype(str)
+    player_gameweeks = _build_player_gameweek_summary(frame)
+
     # Keep a second history keyed only by player.  The season-local features
     # below are useful for recency, but resetting them at every season means
     # a GW1 decision cannot use the prior season that was genuinely known at
     # that deadline.  These career features are still point-in-time safe:
     # ``_strict_prior`` excludes the current gameweek, including double-GW
-    # fixtures, before any rolling statistic is computed.
+    # fixtures, before any rolling statistic is computed.  The calculation is
+    # performed on distinct player/gameweek rows so the second fixture in a
+    # double GW cannot create a fake missing or repeated lag.
     career_source_features = (
         "total_points",
         "xP",
@@ -477,102 +520,144 @@ def build_extended_player_feature_table(
     )
     career_features: dict[str, pd.Series] = {}
     for column in career_source_features:
-        prior = _strict_prior(frame, column)
+        prior = _strict_prior(player_gameweeks, column)
         career_features[f"career_{column}_last"] = prior
-        career_features[f"career_{column}_mean_5"] = _rolling_prior(frame, prior, 5)
-        career_features[f"career_{column}_mean_10"] = _rolling_prior(frame, prior, 10)
-        career_features[f"career_{column}_ewma_5"] = _ewma_prior(frame, prior, 5)
-    frame = pd.concat([frame, pd.DataFrame(career_features, index=frame.index)], axis=1)
-    frame["career_games_before"] = frame.groupby("player_key", sort=False).cumcount()
+        career_features[f"career_{column}_mean_5"] = _rolling_prior(player_gameweeks, prior, 5)
+        career_features[f"career_{column}_mean_10"] = _rolling_prior(player_gameweeks, prior, 10)
+        career_features[f"career_{column}_ewma_5"] = _ewma_prior(player_gameweeks, prior, 5)
+    player_gameweeks = pd.concat(
+        [player_gameweeks, pd.DataFrame(career_features, index=player_gameweeks.index)], axis=1
+    )
+    player_gameweeks["career_games_before"] = player_gameweeks.groupby("player_key", sort=False).cumcount()
 
-    frame["player_season_key"] = frame["player_key"].astype(str) + "|" + frame["season"].astype(str)
-    player_group = frame.groupby("player_season_key", sort=False)
     computed_features: dict[str, pd.Series] = {}
     for column in EXTENDED_SOURCE_FEATURES:
-        prior = _strict_prior(frame, column, group_column="player_season_key")
+        prior = _strict_prior(player_gameweeks, column, group_column="player_season_key")
         computed_features[f"{column}_last"] = prior
         for window in (3, 5, 10):
             computed_features[f"{column}_mean_{window}"] = _rolling_prior(
-                frame, prior, window, group_column="player_season_key"
+                player_gameweeks, prior, window, group_column="player_season_key"
             )
-        computed_features[f"{column}_ewma_5"] = _ewma_prior(frame, prior, 5, group_column="player_season_key")
-    overlapping = [column for column in computed_features if column in frame.columns]
-    if overlapping:
-        frame = frame.drop(columns=overlapping)
-    frame = pd.concat([frame, pd.DataFrame(computed_features, index=frame.index)], axis=1)
-    frame["points_ewma_5"] = frame["total_points_ewma_5"]
-    frame["points_mean_3"] = frame["total_points_mean_3"]
-    frame["points_mean_5"] = frame["total_points_mean_5"]
-    frame["points_mean_10"] = frame["total_points_mean_10"]
+        computed_features[f"{column}_ewma_5"] = _ewma_prior(
+            player_gameweeks, prior, 5, group_column="player_season_key"
+        )
+    player_gameweeks = pd.concat(
+        [player_gameweeks, pd.DataFrame(computed_features, index=player_gameweeks.index)], axis=1
+    )
+    player_gameweeks = pd.concat(
+        [
+            player_gameweeks,
+            pd.DataFrame(
+                {
+                    "points_ewma_5": player_gameweeks["total_points_ewma_5"],
+                    "points_mean_3": player_gameweeks["total_points_mean_3"],
+                    "points_mean_5": player_gameweeks["total_points_mean_5"],
+                    "points_mean_10": player_gameweeks["total_points_mean_10"],
+                },
+                index=player_gameweeks.index,
+            ),
+        ],
+        axis=1,
+    )
 
-    points_prior = _strict_prior(frame, "total_points", group_column="player_season_key")
-    minutes_prior = _strict_prior(frame, "minutes", group_column="player_season_key")
-    selected_prior = _strict_prior(frame, "selected", group_column="player_season_key")
-    transfers_in_prior = _strict_prior(frame, "transfers_in", group_column="player_season_key")
-    transfers_out_prior = _strict_prior(frame, "transfers_out", group_column="player_season_key")
-    value_prior = _strict_prior(frame, "value", group_column="player_season_key")
     std_features: dict[str, pd.Series] = {}
     for column in EXTENDED_SOURCE_FEATURES:
         std_features[f"{column}_std_5"] = _std_prior(
-            frame,
-            _strict_prior(frame, column, group_column="player_season_key"),
+            player_gameweeks,
+            _strict_prior(player_gameweeks, column, group_column="player_season_key"),
             5,
             group_column="player_season_key",
         )
-    frame = pd.concat([frame, pd.DataFrame(std_features, index=frame.index)], axis=1)
-
-    frame["points_ewma_3"] = _ewma_prior(frame, points_prior, 3, group_column="player_season_key")
-    frame["points_ewma_10"] = _ewma_prior(frame, points_prior, 10, group_column="player_season_key")
-    frame["form_acceleration"] = frame["points_ewma_3"] - frame["points_ewma_10"]
-    frame["points_vs_career"] = frame["points_mean_5"] - frame["career_total_points_mean_5"]
-    frame["minutes_vs_career"] = frame["minutes_mean_5"] - frame["career_minutes_mean_5"]
-    frame["price_vs_career"] = frame["value_mean_5"] - frame["career_value_mean_5"]
-    frame["minutes_ewma_10"] = _ewma_prior(frame, minutes_prior, 10, group_column="player_season_key")
-    frame["minutes_trend"] = frame["minutes_ewma_5"] - frame["minutes_ewma_10"]
-    frame["start_rate_5"] = _rolling_prior(
-        frame, _strict_prior(frame, "starts", group_column="player_season_key"), 5, group_column="player_season_key"
-    ) / 1.0
-    frame["minutes_share_5"] = frame["minutes_mean_5"] / 90.0
-    frame["breakout_signal"] = (
-        frame["points_vs_career"].fillna(0.0)
-        * frame["minutes_share_5"].fillna(0.0)
+    player_gameweeks = pd.concat(
+        [player_gameweeks, pd.DataFrame(std_features, index=player_gameweeks.index)], axis=1
     )
-    frame["blank_rate_5"] = _rolling_prior(
-        frame,
+
+    points_prior = player_gameweeks["total_points_last"]
+    minutes_prior = player_gameweeks["minutes_last"]
+    transfers_in_prior = player_gameweeks["transfers_in_last"]
+    transfers_out_prior = player_gameweeks["transfers_out_last"]
+    value_prior = player_gameweeks["value_last"]
+    derived_features: dict[str, pd.Series] = {}
+    derived_features["points_ewma_3"] = _ewma_prior(
+        player_gameweeks, points_prior, 3, group_column="player_season_key"
+    )
+    derived_features["points_ewma_10"] = _ewma_prior(
+        player_gameweeks, points_prior, 10, group_column="player_season_key"
+    )
+    derived_features["form_acceleration"] = derived_features["points_ewma_3"] - derived_features["points_ewma_10"]
+    derived_features["points_vs_career"] = player_gameweeks["points_mean_5"] - player_gameweeks["career_total_points_mean_5"]
+    derived_features["minutes_vs_career"] = player_gameweeks["minutes_mean_5"] - player_gameweeks["career_minutes_mean_5"]
+    derived_features["price_vs_career"] = player_gameweeks["value_mean_5"] - player_gameweeks["career_value_mean_5"]
+    derived_features["minutes_ewma_10"] = _ewma_prior(
+        player_gameweeks, minutes_prior, 10, group_column="player_season_key"
+    )
+    derived_features["minutes_trend"] = player_gameweeks["minutes_ewma_5"] - derived_features["minutes_ewma_10"]
+    derived_features["start_rate_5"] = _rolling_prior(
+        player_gameweeks,
+        player_gameweeks["starts_last"],
+        5,
+        group_column="player_season_key",
+    )
+    derived_features["minutes_share_5"] = player_gameweeks["minutes_mean_5"] / 90.0
+    derived_features["breakout_signal"] = (
+        derived_features["points_vs_career"].fillna(0.0)
+        * derived_features["minutes_share_5"].fillna(0.0)
+    )
+    derived_features["blank_rate_5"] = _rolling_prior(
+        player_gameweeks,
         (points_prior <= 2).astype(float),
         5,
         group_column="player_season_key",
     )
-    frame["hauler_rate_5"] = _rolling_prior(
-        frame,
+    derived_features["hauler_rate_5"] = _rolling_prior(
+        player_gameweeks,
         (points_prior >= 5).astype(float),
         5,
         group_column="player_season_key",
     )
-    frame["ownership_change_5"] = _rolling_prior(
-        frame,
-        _strict_prior(frame, "selected", group_column="player_season_key"),
+    selected_prior = player_gameweeks["selected_last"]
+    derived_features["ownership_change_5"] = _rolling_prior(
+        player_gameweeks,
+        selected_prior,
         3,
         group_column="player_season_key",
     ) - _rolling_prior(
-        frame,
-        _strict_prior(frame, "selected", group_column="player_season_key"),
+        player_gameweeks,
+        selected_prior,
         10,
         group_column="player_season_key",
     )
-    frame["transfer_in_out_ratio_5"] = (
-        _rolling_prior(frame, transfers_in_prior, 5, group_column="player_season_key")
-        / (_rolling_prior(frame, transfers_out_prior, 5, group_column="player_season_key") + 1.0)
+    derived_features["transfer_in_out_ratio_5"] = (
+        _rolling_prior(player_gameweeks, transfers_in_prior, 5, group_column="player_season_key")
+        / (_rolling_prior(player_gameweeks, transfers_out_prior, 5, group_column="player_season_key") + 1.0)
     )
-    frame["transfer_balance_mean_5"] = _rolling_prior(
-        frame,
-        _strict_prior(frame, "transfers_balance", group_column="player_season_key"),
+    derived_features["transfer_balance_mean_5"] = _rolling_prior(
+        player_gameweeks,
+        player_gameweeks["transfers_balance_last"],
         5,
         group_column="player_season_key",
     )
-    frame["price_momentum"] = value_prior - _rolling_prior(frame, value_prior, 5, group_column="player_season_key")
-    frame["value_per_point_5"] = frame["value_mean_5"] / (frame["points_mean_5"] + 1.0)
-    frame["points_per_value_5"] = frame["points_mean_5"] / (frame["value_mean_5"] + 1.0)
+    derived_features["price_momentum"] = value_prior - _rolling_prior(
+        player_gameweeks, value_prior, 5, group_column="player_season_key"
+    )
+    derived_features["value_per_point_5"] = player_gameweeks["value_mean_5"] / (player_gameweeks["points_mean_5"] + 1.0)
+    derived_features["points_per_value_5"] = player_gameweeks["points_mean_5"] / (player_gameweeks["value_mean_5"] + 1.0)
+    player_gameweeks = pd.concat(
+        [player_gameweeks, pd.DataFrame(derived_features, index=player_gameweeks.index)], axis=1
+    )
+
+    feature_columns = [
+        *career_features,
+        "career_games_before",
+        *computed_features,
+        *std_features,
+        *derived_features,
+    ]
+    frame = _broadcast_player_gameweek_features(frame, player_gameweeks, feature_columns)
+    frame["points_ewma_5"] = frame["total_points_ewma_5"]
+    frame["points_mean_3"] = frame["total_points_mean_3"]
+    frame["points_mean_5"] = frame["total_points_mean_5"]
+    frame["points_mean_10"] = frame["total_points_mean_10"]
     # Price changes are gameweek-level labels.  Using the next fixture row
     # would create a spurious zero/within-double-GW movement when a player has
     # two fixtures in the same gameweek.  Build the label on distinct
@@ -596,17 +681,22 @@ def build_extended_player_feature_table(
     # realized points to distinct player/gameweek rows first, so a double GW
     # contributes both fixtures exactly once to the 3- and 8-GW targets.
     horizon_labels = (
-        frame.groupby(["player_season_key", "sequence"], as_index=False, sort=False)["total_points"]
+        frame.groupby(["player_season_key", "season_order", "gameweek", "sequence"], as_index=False, sort=False)[
+            "total_points"
+        ]
         .sum()
         .rename(columns={"total_points": "gameweek_points"})
-        .sort_values(["player_season_key", "sequence"])
+        .sort_values(["player_season_key", "gameweek"])
     )
-    grouped_horizon = horizon_labels.groupby("player_season_key", sort=False)
+    point_lookup = horizon_labels.set_index(["player_season_key", "gameweek"])["gameweek_points"]
     for horizon in (3, 8):
-        horizon_labels[f"target_horizon_points_{horizon}"] = sum(
-            grouped_horizon["gameweek_points"].shift(-offset).fillna(0.0)
-            for offset in range(horizon)
-        )
+        total = np.zeros(len(horizon_labels), dtype=float)
+        for offset in range(horizon):
+            lookup_keys = pd.MultiIndex.from_arrays(
+                [horizon_labels["player_season_key"], horizon_labels["gameweek"] + offset]
+            )
+            total += point_lookup.reindex(lookup_keys).fillna(0.0).to_numpy()
+        horizon_labels[f"target_horizon_points_{horizon}"] = total
     frame = frame.merge(
         horizon_labels[
             ["player_season_key", "sequence", "target_horizon_points_3", "target_horizon_points_8"]
@@ -620,12 +710,34 @@ def build_extended_player_feature_table(
     # at future scores or player outcomes.  The final archive schedule can
     # include later rescheduling, so this is recorded as a schedule feature,
     # not treated as a historical news signal.
+    schedule_rows = frame[
+        ["season_order", "gameweek", "kickoff_time", "team", "opponent_team", "was_home"]
+    ].drop_duplicates()
+    schedule = (
+        schedule_rows.groupby(["season_order", "team", "gameweek"], as_index=False, sort=False)
+        .agg(fixture_count=("opponent_team", "size"), home_count=("was_home", "sum"))
+        .set_index(["season_order", "team", "gameweek"])
+    )
+    base_schedule_keys = [frame["season_order"], frame["team"], frame["gameweek"]]
     for horizon in (3, 5):
-        future_home = [frame.groupby("player_season_key", sort=False)["was_home"].shift(-offset) for offset in range(1, horizon + 1)]
-        future_opponents = [frame.groupby("player_season_key", sort=False)["opponent_team"].shift(-offset) for offset in range(1, horizon + 1)]
-        frame[f"fixtures_next_{horizon}"] = pd.concat(future_opponents, axis=1).notna().sum(axis=1).astype(float)
-        frame[f"home_share_next_{horizon}"] = pd.concat(future_home, axis=1).mean(axis=1).fillna(0.0)
-    frame["fixtures_current_gw"] = frame.groupby(["player_season_key", "sequence"])["sequence"].transform("size").astype(float)
+        fixture_counts = np.zeros(len(frame), dtype=float)
+        home_counts = np.zeros(len(frame), dtype=float)
+        for offset in range(1, horizon + 1):
+            lookup_keys = pd.MultiIndex.from_arrays(
+                [base_schedule_keys[0], base_schedule_keys[1], base_schedule_keys[2] + offset]
+            )
+            future = schedule.reindex(lookup_keys)
+            fixture_counts += future["fixture_count"].fillna(0.0).to_numpy()
+            home_counts += future["home_count"].fillna(0.0).to_numpy()
+        frame[f"fixtures_next_{horizon}"] = fixture_counts
+        frame[f"home_share_next_{horizon}"] = np.divide(
+            home_counts,
+            fixture_counts,
+            out=np.zeros(len(frame), dtype=float),
+            where=fixture_counts > 0,
+        )
+    current_schedule_keys = pd.MultiIndex.from_arrays(base_schedule_keys)
+    frame["fixtures_current_gw"] = schedule.reindex(current_schedule_keys)["fixture_count"].fillna(0.0).to_numpy()
 
     team_features = _build_team_history_features(frame)
     frame["fixture_key"] = _fixture_key(frame)

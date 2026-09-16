@@ -47,6 +47,14 @@ def season_order(season: str) -> int:
     return int(season.split("-")[0])
 
 
+def _distinct_player_gameweeks(frame: pd.DataFrame) -> pd.DataFrame:
+    """Use one row per player/GW for gameweek-level targets and prices."""
+
+    return frame.sort_values(["player_season_key", "sequence"]).drop_duplicates(
+        ["player_season_key", "sequence"], keep="last"
+    )
+
+
 def _forecast_caches(
     raw: pd.DataFrame,
     seasons: list[str],
@@ -67,25 +75,26 @@ def _forecast_caches(
         print(f"  fitting {forecast_model_kind} point/horizon/price models for {season}", flush=True)
         train = feature_frame[feature_frame["season"].isin(prior_seasons)].copy()
         target = feature_frame[feature_frame["season"] == season].copy()
+        gameweek_train = _distinct_player_gameweeks(train)
         if forecast_model_kind == "neural":
             forecast_model = _fit_extended_neural(train)
             short_model = _fit_extended_neural(
-                train.dropna(subset=["target_horizon_points_3"]),
+                gameweek_train.dropna(subset=["target_horizon_points_3"]),
                 target="target_horizon_points_3",
             )
             long_model = _fit_extended_neural(
-                train.dropna(subset=["target_horizon_points_8"]),
+                gameweek_train.dropna(subset=["target_horizon_points_8"]),
                 target="target_horizon_points_8",
             )
         elif forecast_model_kind == "ridge":
             forecast_model = _fit_extended_ridge(train, alpha=60.0)
             short_model = _fit_extended_ridge(
-                train.dropna(subset=["target_horizon_points_3"]),
+                gameweek_train.dropna(subset=["target_horizon_points_3"]),
                 alpha=60.0,
                 target="target_horizon_points_3",
             )
             long_model = _fit_extended_ridge(
-                train.dropna(subset=["target_horizon_points_8"]),
+                gameweek_train.dropna(subset=["target_horizon_points_8"]),
                 alpha=60.0,
                 target="target_horizon_points_8",
             )
@@ -95,7 +104,7 @@ def _forecast_caches(
         forecast_rows["extended_selected"] = forecast_model.predict(_extended_feature_columns(target))
         forecast_rows["forecast_short_expected_points"] = short_model.predict(_extended_feature_columns(target))
         forecast_rows["forecast_long_expected_points"] = long_model.predict(_extended_feature_columns(target))
-        price_train = train.dropna(subset=["target_price_change"])
+        price_train = gameweek_train.dropna(subset=["target_price_change"])
         if price_train.empty:
             forecast_rows["future_price_change_ridge"] = 0.0
         else:

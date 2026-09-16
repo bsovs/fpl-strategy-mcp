@@ -206,23 +206,50 @@ and evaluates neural actions against the free-transfer anchor over points,
 value, template, and randomized opening squads. The forecast bridge is
 walk-forward: it fits point forecasts, direct 3/8-gameweek totals, and a
 next-gameweek price-change model using only earlier seasons. The current
-career-feature baseline produced 1,441 development and 177 validation
-examples; on the untouched 2025/26 replay its best opening family scored
-2,079 points, below the 2,413 research target. It is therefore a research
-artifact, not a promoted champion. The same corrected run's anchored cocktail
-averaged 1,975.75 on the untouched test, so the current public fallback
-remains the transparent anchor until the gate is tuned on additional held-out
-seasons.
+career-feature baseline produced 1,476 development and 186 validation
+examples. After fixing two temporal-grain defects—calendar-window horizon
+labels and double-gameweek lag aggregation—the clean untouched 2025/26 replay
+scored 2,076.25 points on average across four opening families, with a best
+opening of 2,156. The free-transfer anchor averaged 2,008.5 and peaked at
+2,073; the anchored cocktail averaged 2,020.75. These are improvements over
+the anchor in this replay, but the best result is still 257 points below the
+2,413 research target. This remains a research artifact, not a promoted
+champion.
 
 For a model-family ablation, add `--forecast-model ridge`. The expanded ridge
-run reached 2,189 points in its best 2025/26 opening-squad replay (2,113 mean
-across four openings), still 224 points below the target. The direct-horizon
-neural and price-aware variants are retained as inspectable research outputs;
-they are not evidence of a winning strategy by themselves.
+run reached 2,189 points in an earlier replay, but that result used the
+pre-fix temporal grain and is not comparable to the clean result above. The
+direct-horizon neural and price-aware variants are retained as inspectable
+research outputs; they are not evidence of a winning strategy by themselves.
 
 The optional `--starting-modes ... forecast` stress test adds a legal
 forecast-optimized opening squad. It reached 2,162 points on 2025/26, below
 the four-family ridge result, so it is not part of the default benchmark.
+
+## Data coverage and missing signals
+
+The archive is not missing the basic FPL history: it contains 247,896 raw
+player-fixture rows across ten seasons (2016/17 through 2025/26), including
+gameweek points, minutes, starts, form, ownership, transfers, prices, team
+scores, opponents, and fixture timing. The model turns this into 286
+point-in-time features and keeps the 2025/26 season completely out of fitting
+and model selection.
+
+The important gaps are contextual rather than raw player rows. The historical
+archive does not provide a complete timestamped expected-minutes history,
+confirmed team-news/social stream, richer historical fixture-strength feed, or
+real rival-manager actions. The oldest gameweek files also need season-level
+roster snapshots to fill team/position metadata; those rows are flagged and
+are not treated as point-in-time transfer history. Consequently, news/social
+signals are available in the input contract and live ingestion path, but are
+zero/absent in this historical replay unless a timestamped context archive is
+supplied.
+
+The temporal audit found and fixed 293 three-gameweek label mismatches caused
+by skipping blank calendar gameweeks, plus inconsistent lag values in 416
+double-gameweek player groups. The current run uses calendar-window labels
+and one aggregated player/gameweek grain for lags and horizon/price models.
+Details and the remediation plan are in `docs/data-quality-audit.md`.
 
 ## License
 

@@ -125,7 +125,7 @@ class FplLabTests(unittest.TestCase):
         gw1 = features[features["gameweek"] == 1]
         self.assertTrue(gw1["points_mean_5"].isna().all())
         self.assertTrue(gw1["total_points_last"].isna().all())
-        self.assertEqual(features.iloc[-1]["total_points_last"], 1)
+        self.assertEqual(features.iloc[-1]["total_points_last"], 16)
 
     def test_extended_features_carry_prior_season_player_history_without_leakage(self):
         raw = pd.DataFrame(
@@ -172,6 +172,18 @@ class FplLabTests(unittest.TestCase):
         gw1 = features[features["gameweek"] == 1]
         self.assertEqual(set(gw1["target_price_change"]), {1.0})
         self.assertEqual(set(gw1["target_horizon_points_3"]), {9.0})
+
+    def test_horizon_target_uses_calendar_gameweeks_when_player_has_a_blank(self):
+        raw = pd.DataFrame(
+            [
+                {"name": "Player", "element": 8, "position": "MID", "team": 1, "opponent_team": 2, "kickoff_time": "2024-08-01T12:00:00Z", "was_home": True, "total_points": 1, "value": 60, "season": "2024-25", "season_order": 2024, "gameweek": 1, "fixture": 1},
+                {"name": "Player", "element": 8, "position": "MID", "team": 1, "opponent_team": 3, "kickoff_time": "2024-08-15T12:00:00Z", "was_home": True, "total_points": 5, "value": 60, "season": "2024-25", "season_order": 2024, "gameweek": 3, "fixture": 2},
+                {"name": "Player", "element": 8, "position": "MID", "team": 1, "opponent_team": 4, "kickoff_time": "2024-08-22T12:00:00Z", "was_home": True, "total_points": 7, "value": 60, "season": "2024-25", "season_order": 2024, "gameweek": 4, "fixture": 3},
+            ]
+        )
+        features = build_extended_player_feature_table(raw)
+        gw1 = features[features["gameweek"] == 1]
+        self.assertEqual(set(gw1["target_horizon_points_3"]), {6.0})
 
     def test_decision_layer_scores_legal_same_position_move(self):
         current = [PlayerState("out", "Out", "MID", "A", 7.0, 6.9)]

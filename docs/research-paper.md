@@ -95,6 +95,16 @@ MAE and top-20 selection value but slightly reduced RMSE and Spearman, so it
 is retained as a research feature set rather than treated as a universal
 forecast winner.
 
+The archive is broad enough for a serious replay but not complete enough to
+support every desired feature historically. It lacks a full timestamped
+expected-minutes history, confirmed team-news/social stream, richer historical
+fixture-strength feed, and real rival-manager actions. The oldest gameweek
+files also require season-level roster snapshots for team/position metadata;
+those rows carry explicit imputation flags. The clean data audit found 293
+calendar-horizon mismatches and 416 inconsistent double-gameweek lag groups in
+the pre-fix implementation; both defects are now covered by the player-
+gameweek aggregation and regression tests. See `docs/data-quality-audit.md`.
+
 ### 2.2 Legal decision layer
 
 The decision layer receives the exact squad and buyable pool. It enforces:
@@ -170,58 +180,40 @@ for correct Bench Boost, captain, Free Hit, and transfer comparisons; keeping
 only one fixture would understate the value of a double gameweek.
 
 The bridge carries three forecast families into the action state: the
-one-fixture point model, direct short/long horizon models, and a price-change
+fixture-level point model, direct short/long horizon models, and a price-change
 ridge. These are deliberately evaluated as ablations rather than blended by
-assumption. Direct horizon values are averaged across duplicated
-double-gameweek rows because they are repeated labels, while fixture-level
-point predictions are summed.
+assumption. Direct horizon and price models are fit on one distinct
+player/gameweek row, while fixture-level point predictions are summed. This
+prevents a double gameweek from duplicating a pre-gameweek lag or price label.
 
 This is still a small benchmark. It is designed to prevent premature claims,
 not to establish a final public leaderboard.
 
 ## 4. Current results
 
-The corrected career-feature action run generated 1,441 development and 177
-validation counterfactual examples. The smaller action ensemble was selected
-on validation (RMSE 7.983 versus 8.695 for the default ensemble; state-level
-argmax accuracy 18.75% versus 25%). On 2024–25, the neural policy averaged
-2,129.0 points across the four opening families versus 2,060.25 for the
-points-only free-transfer anchor. This advantage was not uniform: the value
-and randomized openings favored the anchor, so the result is not a deployment
-guarantee.
+The clean corrected action run generated 1,476 development and 186 validation
+counterfactual examples. The smaller action ensemble was selected on
+validation (RMSE 9.016 versus 9.787 for the default ensemble; state-level
+argmax accuracy 6.25% versus 12.5%). On 2024–25, the neural policy averaged
+2,077.0 points across the four opening families versus 2,006.75 for the
+points-only free-transfer anchor. This advantage was not uniform across
+opening squads, so it is not a deployment guarantee.
 
-On the untouched 2025–26 replay, the corrected neural policy averaged 2,021.0
-points versus 1,915.25 for that run's anchor, with paired gains of 78, 65,
-170, and 110 points across the four opening families. The best neural opening
-scored 2,079 points. This remains 334 points below the 2,413 research target
-and is based on one held-out season with synthetic opening squads. The
-artifact is therefore not promoted to the public MCP champion yet.
+On the untouched 2025–26 replay, the corrected neural policy averaged 2,076.25
+points versus 2,008.5 for the anchor. Its four opening results were 2,088,
+2,156, 2,046, and 2,015; the anchor results were 2,028, 2,073, 2,034, and
+1,899. The best neural opening scored 2,156, which is 257 points below the
+2,413 research target. This is one held-out season with synthetic opening
+squads, so the artifact is not promoted to the public MCP champion.
 
-The anchored cocktail was also replayed with the same action model and legal
-search. It averaged 2,095.75 on validation and 1,975.75 on 2025–26, versus
-the neural policy's 2,021.0 on that test. The cocktail was better than the
-anchor on average but worse than raw neural, with negative gains in two of the
-four test opening families; the transparent anchor remains the safer deployed
-fallback while gate tuning is treated as a separate validation-only
-experiment.
+The anchored cocktail averaged 2,020.75 on the untouched 2025–26 test and
+peaked at 2,092. The earlier ridge bridge reached 2,189 in its best opening
+family, but that run used the pre-fix temporal grain. It remains an
+inspectable ablation and must not be compared directly with the clean result.
 
-Two additional walk-forward ablations make the current boundary clearer. A
-direct-horizon neural bridge plus price model scored 1,914.25 mean points on
-the untouched test, despite a stronger validation action argmax score. A
-ridge point/direct-horizon/price bridge scored 2,113.0 mean and 2,189 in its
-best opening family. The ridge result is the strongest current ablation, but
-it remains 224 points below 2,413 and is based on one held-out season, so it
-is not promoted as the public champion. A separate price-aware neural run
-without direct horizons scored 1,994.25 mean and 2,035 best; price forecasts
-are therefore retained as an available feature, not assumed to improve
-decisions.
-
-As a starting-squad stress test, an optional forecast-optimized legal opening
-family was added to the same ridge bridge. It scored 2,162 on 2025–26 versus
-1,929 for its free-transfer anchor, but its validation action error was worse
-than the four-family run and it did not beat the 2,189 best. This supports
-reporting opening-squad sensitivity explicitly rather than selecting the
-most favorable starting family after seeing the test season.
+The clean run is the authoritative current benchmark because it uses
+calendar-window horizon labels, player/gameweek-level lag aggregation, and
+distinct player/gameweek training rows for direct horizon and price models.
 
 The result also illustrates why “the neural network scored more on average” is
 not enough. The action space is path-dependent, chip timing has opportunity
