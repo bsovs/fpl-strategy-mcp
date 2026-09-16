@@ -3,6 +3,25 @@
 The binary has two transports. Use stdio when the MCP host is on the same
 computer. Use Streamable HTTP only when a client needs a URL.
 
+## One-command setup
+
+macOS/Linux:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/bsovs/fpl-strategy-mcp/main/install.sh | sh -s -- --clients all
+```
+
+Windows PowerShell:
+
+```powershell
+$env:FPL_STRATEGY_CLIENTS="all"; irm https://raw.githubusercontent.com/bsovs/fpl-strategy-mcp/main/install.ps1 | iex
+```
+
+The installer downloads the matching release binary, configures the selected
+clients, backs up an existing Claude Desktop config, and runs
+`fpl-strategy-mcp status`. To configure an existing installation later, run
+`fpl-strategy-mcp setup --clients all`.
+
 ## Claude Desktop and Claude Code
 
 Start the local server through the installed binary:
@@ -28,8 +47,9 @@ For Claude Code:
 claude mcp add fpl-strategy -- /absolute/path/to/fpl-strategy-mcp
 ```
 
-Restart Claude Desktop after editing its file. Do not add logging to stdout;
-MCP protocol messages must remain the only stdout output.
+Restart Claude Desktop after editing its file. MCP protocol messages remain the
+only stdout output. The readiness line goes to stderr, and
+`fpl-strategy-mcp status` provides a human-readable or JSON diagnostic report.
 
 ## ChatGPT or Claude web
 
@@ -44,6 +64,9 @@ The endpoint is `http://127.0.0.1:8000/mcp`. A web client cannot reach that
 private address directly. Put it behind an HTTPS tunnel or reverse proxy with
 authentication, then register the resulting URL as a custom connector/remote
 MCP server. Treat the URL and token as credentials.
+
+While running, check `http://127.0.0.1:8000/health`; it returns the same JSON
+readiness report and inherits the bearer-token guard when configured.
 
 OpenAI’s Responses API documents remote MCP tools in its [MCP tool
 reference](https://developers.openai.com/api/reference/cli/resources/beta/subresources/responses).
@@ -61,4 +84,3 @@ source checkout:
 ```sh
 python -m fpl_strategy_mcp < examples/stdio-initialize.jsonl
 ```
-

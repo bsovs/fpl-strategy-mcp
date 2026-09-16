@@ -21,6 +21,7 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
     ) from exc
 
 from .server import SERVER_NAME, _recommend, _strategy_info
+from .server import _status_payload
 
 
 mcp = MCPServer(SERVER_NAME)
@@ -96,6 +97,12 @@ class _BearerTokenMiddleware:
         await self.app(scope, receive, send)
 
 
+async def _health(request):
+    """Small human- and machine-readable readiness endpoint."""
+
+    return JSONResponse(_status_payload())
+
+
 def run_http(host: str = "127.0.0.1", port: int = 8000) -> None:
     """Serve the MCP endpoint at ``/mcp`` using Streamable HTTP."""
 
@@ -103,8 +110,8 @@ def run_http(host: str = "127.0.0.1", port: int = 8000) -> None:
         streamable_http_path="/mcp",
         json_response=True,
     )
+    app.add_route("/health", _health, methods=["GET"])
     token = os.environ.get("FPL_MCP_BEARER_TOKEN")
     if token:
         app = _BearerTokenMiddleware(app, token)
     uvicorn.run(app, host=host, port=port, log_level="info")
-

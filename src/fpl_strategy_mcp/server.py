@@ -23,7 +23,10 @@ import json
 import math
 import os
 from pathlib import Path
+import shutil
 import sys
+import subprocess
+import time
 from typing import Any
 
 import joblib
@@ -47,7 +50,7 @@ from fpl_lab.simulator import CHIP_KINDS
 
 
 SERVER_NAME = "fpl-strategy"
-SERVER_VERSION = "0.1.2"
+SERVER_VERSION = "0.1.3"
 PROTOCOL_VERSION = "2024-11-05"
 PACKAGE_ASSETS = Path(__file__).resolve().parent / "assets"
 DEFAULT_MODEL = ROOT / "assets" / "action-policy-model.joblib"
@@ -68,6 +71,210 @@ def _asset_path(filename: str) -> Path:
         if str(candidate) and candidate.exists():
             return candidate
     return candidates[0]
+
+
+def _server_command() -> list[str]:
+    """Return the command a local MCP client should launch."""
+
+    if getattr(sys, "frozen", False):
+        return [str(Path(sys.executable).resolve())]
+    installed = shutil.which("fpl-strategy-mcp")
+    if installed:
+        return [installed]
+    return [sys.executable, "-m", "fpl_strategy_mcp"]
+
+
+def _claude_desktop_config_path() -> Path:
+    """Return the conventional Claude Desktop config path for this platform."""
+
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json"
+    if os.name == "nt":
+        appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        return Path(appdata) / "Claude" / "claude_desktop_config.json"
+    config_home = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(config_home) / "Claude" / "claude_desktop_config.json"
+
+
+def _backup_file(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    backup = path.with_name(f"{path.name}.bak-{int(time.time())}")
+    shutil.copy2(path, backup)
+    return str(backup)
+
+
+def _write_json_file(path: Path, payload: dict[str, Any]) -> str | None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    backup = _backup_file(path)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+    return backup
+
+
+def _configure_claude_desktop(command: list[str]) -> dict[str, Any]:
+    path = _claude_desktop_config_path()
+    if path.exists() and path.read_text(encoding="utf-8").strip():
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(f"Claude Desktop config must be a JSON object: {path}")
+    else:
+        payload = {}
+    servers = payload.setdefault("mcpServers", {})
+    if not isinstance(servers, dict):
+        raise ValueError(f"Claude Desktop mcpServers must be an object: {path}")
+    entry: dict[str, Any] = {"command": command[0]}
+    if len(command) > 1:
+        entry["args"] = command[1:]
+    servers[SERVER_NAME] = entry
+    backup = _write_json_file(path, payload)
+    return {"status": "configured", "path": str(path), "backup": backup, "entry": entry}
+
+
+def _replace_cli_mcp_server(cli_name: str, command: list[str]) -> dict[str, Any]:
+    executable = shutil.which(cli_name)
+    if not executable:
+        return {"status": "not_found", "client": cli_name}
+    remove = subprocess.run(
+        [executable, "mcp", "remove", SERVER_NAME],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    add = subprocess.run(
+        [executable, "mcp", "add", SERVER_NAME, "--", *command],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    if add.returncode != 0:
+        detail = (add.stderr or add.stdout or "unknown error").strip()
+        return {"status": "error", "client": cli_name, "error": detail}
+    return {
+        "status": "configured",
+        "client": cli_name,
+        "removed_existing": remove.returncode == 0,
+        "output": (add.stdout or "").strip(),
+    }
+
+
+def _parse_clients(value: str) -> set[str]:
+    requested = {item.strip().lower().replace("_", "-") for item in value.split(",") if item.strip()}
+    if not requested or requested == {"none"}:
+        return set()
+    if "all" in requested:
+        requested |= {"claude", "codex"}
+        requested.discard("all")
+    aliases = {
+        "claude-desktop": "claude",
+        "claude-code": "claude",
+    }
+    requested = {aliases.get(item, item) for item in requested}
+    unknown = requested - {"claude", "codex"}
+    if unknown:
+        raise ValueError(f"unknown client(s): {sorted(unknown)}; use claude, codex, or all")
+    return requested
+
+
+def _setup_clients(value: str) -> dict[str, Any]:
+    command = _server_command()
+    clients = _parse_clients(value)
+    results: dict[str, Any] = {"command": command, "requested": sorted(clients)}
+    if "claude" in clients:
+        results["claude_desktop"] = _configure_claude_desktop(command)
+        results["claude_code"] = _replace_cli_mcp_server("claude", command)
+    if "codex" in clients:
+        results["codex"] = _replace_cli_mcp_server("codex", command)
+    return results
+
+
+def _config_has_server(path: Path) -> bool:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return isinstance(payload, dict) and SERVER_NAME in (payload.get("mcpServers") or {})
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _cli_status(cli_name: str) -> dict[str, Any]:
+    executable = shutil.which(cli_name)
+    if not executable:
+        return {"available": False, "configured": False}
+    try:
+        result = subprocess.run(
+            [executable, "mcp", "get", SERVER_NAME],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {"available": True, "configured": False}
+    return {"available": True, "configured": result.returncode == 0}
+
+
+def _status_payload() -> dict[str, Any]:
+    model, model_path, model_error = _load_model()
+    bootstrap_path = _asset_path("bootstrap-static.snapshot.json")
+    claude_path = _claude_desktop_config_path()
+    return {
+        "status": "ready" if model is not None and bootstrap_path.exists() else "degraded",
+        "server": SERVER_NAME,
+        "version": SERVER_VERSION,
+        "default_transport": "stdio",
+        "protocol_version": PROTOCOL_VERSION,
+        "model_loaded": model is not None,
+        "model_path": model_path,
+        "model_error": model_error,
+        "bootstrap_snapshot": str(bootstrap_path),
+        "bootstrap_present": bootstrap_path.exists(),
+        "clients": {
+            "claude_desktop": {
+                "configured": _config_has_server(claude_path),
+                "config_path": str(claude_path),
+            },
+            "claude_code_cli": _cli_status("claude"),
+            "codex_cli": _cli_status("codex"),
+        },
+    }
+
+
+def _print_status(payload: dict[str, Any]) -> None:
+    print(f"FPL Strategy MCP {payload['version']}")
+    print(f"Status: {str(payload['status']).upper()}")
+    print(f"Model: {'loaded' if payload['model_loaded'] else 'not loaded'}")
+    print(f"Bootstrap snapshot: {'present' if payload['bootstrap_present'] else 'missing'}")
+    clients = payload["clients"]
+    claude = clients["claude_desktop"]
+    print(f"Claude Desktop: {'configured' if claude['configured'] else 'not configured'}")
+    claude_code = clients["claude_code_cli"]
+    codex = clients["codex_cli"]
+    print(
+        "Claude Code CLI: "
+        + ("configured" if claude_code["configured"] else "available, not configured" if claude_code["available"] else "not found")
+    )
+    print(
+        "Codex CLI: "
+        + ("configured" if codex["configured"] else "available, not configured" if codex["available"] else "not found")
+    )
+    if payload.get("model_error"):
+        print(f"Model error: {payload['model_error']}")
+
+
+def _print_setup(payload: dict[str, Any]) -> None:
+    print(f"Configured command: {' '.join(payload['command'])}")
+    for name in ("claude_desktop", "claude_code", "codex"):
+        result = payload.get(name)
+        if not result:
+            continue
+        status = result.get("status", "unknown")
+        suffix = result.get("path") or result.get("error") or result.get("client", "")
+        print(f"{name}: {status}{f' ({suffix})' if suffix else ''}")
+        if result.get("backup"):
+            print(f"  backup: {result['backup']}")
 
 
 def _json(value: Any) -> str:
@@ -527,6 +734,13 @@ def _dispatch(request: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _stdio_main() -> None:
+    if os.environ.get("FPL_MCP_QUIET") != "1":
+        print(
+            f"FPL Strategy MCP {SERVER_VERSION} ready on stdio "
+            f"(model asset: {'present' if _asset_path('action-policy-model.joblib').exists() else 'missing'})",
+            file=sys.stderr,
+            flush=True,
+        )
     for line in sys.stdin:
         if not line.strip():
             continue
@@ -549,11 +763,18 @@ def _stdio_main() -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Start the local stdio server or the optional Streamable HTTP server."""
+    """Start the server, inspect health, or configure local MCP clients."""
 
     import argparse
 
     parser = argparse.ArgumentParser(description="FPL Strategy MCP server")
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=("serve", "status", "setup", "version"),
+        default="serve",
+        help="serve the MCP (default), print status, configure clients, or print the version",
+    )
     parser.add_argument(
         "--transport",
         choices=("stdio", "streamable-http"),
@@ -562,7 +783,44 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--host", default="127.0.0.1", help="HTTP bind address")
     parser.add_argument("--port", type=int, default=8000, help="HTTP port")
+    parser.add_argument(
+        "--clients",
+        default=os.environ.get("FPL_STRATEGY_CLIENTS", "all"),
+        help="comma-separated clients for setup: claude, codex, or all",
+    )
+    parser.add_argument("--json", action="store_true", help="print status/setup output as JSON")
+    parser.add_argument("--quiet", action="store_true", help="suppress the stdio readiness line")
     args = parser.parse_args(argv)
+    if args.command == "version":
+        print(SERVER_VERSION)
+        return
+    if args.command == "status":
+        payload = _status_payload()
+        if args.json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        else:
+            _print_status(payload)
+        if payload["status"] != "ready":
+            raise SystemExit(1)
+        return
+    if args.command == "setup":
+        try:
+            payload = _setup_clients(args.clients)
+        except Exception as exc:
+            if args.json:
+                print(json.dumps({"status": "error", "error": str(exc)}))
+            else:
+                print(f"Setup failed: {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
+        if args.json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        else:
+            _print_setup(payload)
+        if any(result.get("status") == "error" for key, result in payload.items() if isinstance(result, dict) and key != "command"):
+            raise SystemExit(1)
+        return
+    if args.quiet:
+        os.environ["FPL_MCP_QUIET"] = "1"
     if args.transport == "stdio":
         _stdio_main()
         return

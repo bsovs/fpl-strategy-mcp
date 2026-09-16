@@ -9,16 +9,20 @@ It is an action policy, not a promise that one player will score the most points
 macOS or Linux:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/bsovs/fpl-strategy-mcp/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/bsovs/fpl-strategy-mcp/main/install.sh | sh -s -- --clients all
 ```
 
 Windows PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/bsovs/fpl-strategy-mcp/main/install.ps1 | iex
+$env:FPL_STRATEGY_CLIENTS="all"; irm https://raw.githubusercontent.com/bsovs/fpl-strategy-mcp/main/install.ps1 | iex
 ```
 
-The installers download the latest release binary; each GitHub release also publishes SHA-256 checksums. To pin a version, set `FPL_STRATEGY_VERSION=0.1.2` before running the installer.
+The installers download the latest release binary, register it with the selected
+clients, and run a health check. Use `--clients claude`, `--clients codex`, or
+`--clients none` to narrow the setup. Existing Claude JSON is backed up before
+it is changed. Each GitHub release also publishes SHA-256 checksums. To pin a
+version, set `FPL_STRATEGY_VERSION=0.1.3` before running the installer.
 
 ## Connect a client
 
@@ -26,6 +30,20 @@ The default command is a stdio MCP server:
 
 ```sh
 fpl-strategy-mcp
+```
+
+The server writes one readiness line to stderr so MCP protocol stdout stays
+clean. To inspect the installation later:
+
+```sh
+fpl-strategy-mcp status
+fpl-strategy-mcp status --json
+```
+
+To register an already-installed binary:
+
+```sh
+fpl-strategy-mcp setup --clients all
 ```
 
 In Claude Desktop, add the installed command to `claude_desktop_config.json` under `mcpServers`. Use the absolute path to the binary:
@@ -40,7 +58,7 @@ In Claude Desktop, add the installed command to `claude_desktop_config.json` und
 }
 ```
 
-On macOS the file is `~/Library/Application Support/Claude/claude_desktop_config.json`; on Windows it is `%APPDATA%\Claude\claude_desktop_config.json`. Fully restart Claude after editing it. The same stdio command works with Claude Code and other local MCP hosts.
+On macOS the file is `~/Library/Application Support/Claude/claude_desktop_config.json`; on Windows it is `%APPDATA%\Claude\claude_desktop_config.json`. Fully restart Claude after editing it. The same stdio command works with Claude Code and Codex; the installer can register both automatically.
 
 For ChatGPT or Claude web, start the optional remote transport:
 
@@ -50,6 +68,9 @@ FPL_MCP_BEARER_TOKEN="choose-a-long-random-token" \
 ```
 
 Expose `http://127.0.0.1:8000/mcp` through an HTTPS tunnel or authenticated reverse proxy, then add that HTTPS MCP URL as a custom connector/remote MCP server. Do not expose an unauthenticated listener. OpenAI’s API can call remote MCP servers through the Responses API; Claude web also expects a reachable remote connector. The default stdio mode remains the safer local option.
+
+For HTTP mode, `http://127.0.0.1:8000/health` returns a JSON readiness report
+and is protected by `FPL_MCP_BEARER_TOKEN` when that variable is set.
 
 ## Input
 
