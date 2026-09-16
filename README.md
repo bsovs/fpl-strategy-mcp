@@ -18,7 +18,7 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/bsovs/fpl-strategy-mcp/main/install.ps1 | iex
 ```
 
-The installers download the latest release binary; each GitHub release also publishes SHA-256 checksums. To pin a version, set `FPL_STRATEGY_VERSION=0.1.1` before running the installer.
+The installers download the latest release binary; each GitHub release also publishes SHA-256 checksums. To pin a version, set `FPL_STRATEGY_VERSION=0.1.2` before running the installer.
 
 ## Connect a client
 
