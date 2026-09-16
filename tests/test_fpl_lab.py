@@ -10,7 +10,7 @@ from fpl_lab.context import ContextStore
 from fpl_lab.data import Match, load_matches, to_team_observations
 from fpl_lab.decision import DecisionConfig, PlayerSignal, PlayerState, recommend_transfers
 from fpl_lab.model import PoissonTeamGoalsModel
-from fpl_lab.player_models import build_player_feature_table
+from fpl_lab.player_models import build_extended_player_feature_table, build_player_feature_table
 from fpl_lab.policy import ActionValueEnsemble, ActionValueMLP, PolicyAction, PolicyState, encode_state_action
 from fpl_lab.simulator import season_rules, selling_price_tenths
 
@@ -91,6 +91,20 @@ class FplLabTests(unittest.TestCase):
         self.assertEqual(set(features["position"]), {"GK"})
         self.assertTrue(pd.isna(features.iloc[0]["total_points_last"]))
         self.assertEqual(features.iloc[1]["total_points_last"], 2)
+
+    def test_extended_features_block_double_gameweek_result_leakage(self):
+        raw = pd.DataFrame(
+            [
+                {"name": "Player", "position": "MID", "team": 1, "opponent_team": 2, "kickoff_time": "2024-08-01T12:00:00Z", "was_home": True, "total_points": 15, "team_h_score": 3, "team_a_score": 0, "season": "2024-25", "season_order": 2024, "gameweek": 1, "element": 7},
+                {"name": "Player", "position": "MID", "team": 1, "opponent_team": 3, "kickoff_time": "2024-08-04T12:00:00Z", "was_home": False, "total_points": 1, "team_h_score": 0, "team_a_score": 0, "season": "2024-25", "season_order": 2024, "gameweek": 1, "element": 7},
+                {"name": "Player", "position": "MID", "team": 1, "opponent_team": 4, "kickoff_time": "2024-08-10T12:00:00Z", "was_home": True, "total_points": 4, "team_h_score": 1, "team_a_score": 0, "season": "2024-25", "season_order": 2024, "gameweek": 2, "element": 7},
+            ]
+        )
+        features = build_extended_player_feature_table(raw)
+        gw1 = features[features["gameweek"] == 1]
+        self.assertTrue(gw1["points_mean_5"].isna().all())
+        self.assertTrue(gw1["total_points_last"].isna().all())
+        self.assertEqual(features.iloc[-1]["total_points_last"], 1)
 
     def test_decision_layer_scores_legal_same_position_move(self):
         current = [PlayerState("out", "Out", "MID", "A", 7.0, 6.9)]

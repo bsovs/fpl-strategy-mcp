@@ -51,7 +51,8 @@ fixture deltas, form, value, role security, injury/rotation risk, price-change
 risk, uncertainty, captain upside, ownership leverage, and structured news or
 social fields.
 
-The literature-driven starting benchmark used public historical FPL data with
+The literature-driven starting benchmark (before the expanded archive run)
+used public historical FPL data with
 leakage-safe lagged and rolling features. It compared a last-five mean,
 EWMA(5), regularized ridge, and position-specific random forests. On a final
 2024–25 holdout season, the position-specific forest had the lowest MAE by a
@@ -65,6 +66,25 @@ small margin while ridge had the lowest RMSE by a similarly small margin:
 | Position-specific random forest | 1.928 | 1.034 |
 
 These are player-fixture forecast errors, not proof of transfer profitability.
+
+The expanded local trainer now uses the complete public Vaastav archive from
+2016–17 through 2025–26. The temporal protocol is development on 2016–17
+through 2023–24, model selection on 2024–25, and an untouched final test on
+2025–26. It produces 163,082 player-fixture feature rows from 247,896 raw
+rows and uses 227 model inputs: lagged player form and volatility, minutes and
+starts, ownership and transfer movement, price momentum, team/opponent and
+prior-matchup form, fixture-shape counts, and optional timestamped context.
+All player and team lags are guarded by season/gameweek sequence, which blocks
+double-gameweek result leakage.
+
+On the untouched 2025–26 test, the selected stronger-ridge forecast had RMSE
+1.947 and MAE 1.005, compared with MAE 1.038 for EWMA(5). Its top-20-per-
+gameweek selection had a realized mean of 4.274 points, compared with 3.695
+for EWMA(5). A separate next-price-change ridge had MAE 0.119 in the source
+price-tenth unit. The neural forecast candidate was trained and evaluated in
+the validation protocol, but was not selected because the regularized model
+performed better on 2024–25. This is an intended anti-overfitting result, not
+a reason to force a neural model into production.
 
 ### 2.2 Legal decision layer
 
@@ -123,6 +143,12 @@ The action-policy experiment used an expanding temporal protocol:
   against the free-transfer anchor;
 - holdout was not used for selection.
 
+The simulator now also searches sequentially legal multi-transfer bundles for
+wildcard and free-hit actions up to the 15-player squad depth. Each step
+recomputes bank, selling price, team caps, position legality, and the already
+selected players. This prevents the action learner from treating every move
+as an isolated one-for-one transfer.
+
 This is still a small benchmark. It is designed to prevent premature claims,
 not to establish a final public leaderboard.
 
@@ -145,6 +171,18 @@ not enough. The action space is path-dependent, chip timing has opportunity
 cost, and model errors compound over a season. A strategy can win a few
 simulations while having an unacceptable downside or unstable behavior across
 starting squads.
+
+The current expanded forecast layer has not yet produced a validated
+2,413-point strategy. The 2,413 figure is therefore treated as a strategy
+benchmark/aspiration, not as a supervised player-point label. Clearing it
+requires a full-season legal replay with chips, formation, captaincy,
+multi-transfer bundles, price economics, and a held-out family of starting
+squads; a player forecast that ranks well is not sufficient. In a first
+2025–26 bridge smoke test, the expanded forecasts produced 1,942–1,992 net
+points across three legal starting-squad modes under the same free-transfer
+policy, versus 1,789–1,807 for the legacy signals. The shipped action cocktail
+with chips scored 1,982 on the template start. These are useful integration
+checks, not tuned final results, and none clears 2,413.
 
 ## 5. News, social context, and price information
 

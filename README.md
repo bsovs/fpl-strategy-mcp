@@ -131,6 +131,57 @@ python -m unittest discover -s tests -q
 
 The model and bootstrap snapshot are bundled under `assets/`. Historical training and evaluation artifacts are documented in the paper rather than required to run the server.
 
+## Train the local historical forecast layer
+
+The research trainer keeps a complete final season untouched. The current
+protocol uses 2016/17–2023/24 for development, 2024/25 for model selection,
+and 2025/26 as the final test season. Download the raw Vaastav archive into a
+local data directory, then run:
+
+```sh
+python - <<'PY'
+from fpl_lab.history import download_seasons
+download_seasons(
+    ["2016-17", "2017-18", "2018-19", "2019-20", "2020-21", "2021-22",
+     "2022-23", "2023-24", "2024-25", "2025-26"],
+    "data/vaastav",
+)
+PY
+
+PYTHONPATH=src python scripts/train_player_models.py \
+  --history-root data/vaastav \
+  --validation-season 2024-25 \
+  --evaluation-season 2025-26 \
+  --output-dir runs/player-models
+```
+
+The trainer builds 200+ numeric point-in-time features plus categorical context:
+lagged form and volatility, minutes/start security, ownership and transfer
+momentum, price movement, team/opponent and prior-matchup form, schedule shape,
+and optional timestamped news/social context. It writes the selected player
+forecast model, a future-price model, evaluation predictions, metrics, and a
+data audit under `runs/player-models/`. News/social columns remain zero unless
+an auditable `ContextStore` is supplied; modern articles are never backfilled
+into old seasons. These forecast artifacts are research inputs and are not
+promoted to the shipped action-policy champion until the legal season
+simulator shows a robust strategy-level improvement.
+
+To test decision value on the held-out season, bridge the forecast CSV into
+the legal simulator:
+
+```sh
+PYTHONPATH=src python scripts/backtest_forecast_strategy.py \
+  --history-root data/vaastav \
+  --forecast-csv runs/player-models/evaluation-predictions.csv \
+  --season 2025-26 \
+  --previous-season 2024-25
+```
+
+This compares the legacy signals and expanded forecasts under the same
+rules-aware free-transfer policy. It is a strategy smoke test; the final
+cocktail still needs walk-forward action-value training and held-out starting
+squad families before a 2,413-point claim is defensible.
+
 ## License
 
 MIT. This is an independent research tool and is not affiliated with the Premier League or Fantasy Premier League.

@@ -401,6 +401,90 @@ def build_signal_cache(
     }
 
 
+def build_model_signal_cache(
+    current: SeasonData,
+    forecast_rows: pd.DataFrame,
+    short_horizon: int = 3,
+    long_horizon: int = 8,
+) -> dict[int, list[PlayerSignal]]:
+    """Convert point-in-time forecast rows into simulator signals.
+
+    The adapter keeps the forecast layer separate from the action policy. A
+    row is expected to contain the held-out player's predicted next-fixture
+    points and, when available, predicted price change. Missing players fall
+    back to a zero-information signal rather than borrowing a later outcome.
+    """
+
+    required = {"gameweek", "element", "extended_selected"}
+    missing = required - set(forecast_rows.columns)
+    if missing:
+        raise ValueError(f"forecast rows missing columns: {sorted(missing)}")
+    frame = forecast_rows.copy()
+    frame["player_id"] = (
+        pd.to_numeric(frame["element"], errors="coerce")
+        .round()
+        .astype("Int64")
+        .astype(str)
+    )
+    frame["gameweek"] = pd.to_numeric(frame["gameweek"], errors="coerce").astype(int)
+    frame["extended_selected"] = pd.to_numeric(frame["extended_selected"], errors="coerce").fillna(0.0)
+    if "future_price_change_ridge" not in frame:
+        frame["future_price_change_ridge"] = 0.0
+    frame["future_price_change_ridge"] = pd.to_numeric(
+        frame["future_price_change_ridge"], errors="coerce"
+    ).fillna(0.0)
+    if frame.duplicated(["gameweek", "player_id"]).any():
+        frame = frame.drop_duplicates(["gameweek", "player_id"], keep="last")
+
+    result: dict[int, list[PlayerSignal]] = {}
+    for gameweek in sorted(current.snapshots_by_gw):
+        rows = frame[frame["gameweek"] == gameweek]
+        by_id = {str(row.player_id): row for row in rows.itertuples(index=False)}
+        signals: list[PlayerSignal] = []
+        # Include the full season universe because a squad can still own a
+        # player whose source row is missing in this GW; ``current.snapshot``
+        # then supplies the last known price/identity for that player.
+        player_ids = set(current.history_by_player).union(current.snapshots_by_gw[gameweek])
+        for player_id in sorted(player_ids):
+            row = by_id.get(str(player_id))
+            if row is None:
+                signals.append(PlayerSignal(player_id=player_id, short_expected_points=0.0, long_expected_points=0.0))
+                continue
+            next_points = max(0.0, float(row.extended_selected))
+            price_change = float(row.future_price_change_ridge)
+            minutes_share = float(getattr(row, "minutes_share_5", 0.0) or 0.0)
+            form_acceleration = float(getattr(row, "form_acceleration", 0.0) or 0.0)
+            news_risk = float(getattr(row, "news_risk", 0.0) or 0.0)
+            social_sentiment = float(getattr(row, "social_sentiment", 0.0) or 0.0)
+            short_fixtures = float(getattr(row, "fixtures_next_3", short_horizon) or short_horizon)
+            long_fixtures = float(getattr(row, "fixtures_next_5", long_horizon) or long_horizon)
+            signals.append(
+                PlayerSignal(
+                    player_id=player_id,
+                    short_expected_points=next_points * max(1.0, min(float(short_horizon), short_fixtures)),
+                    long_expected_points=next_points * max(1.0, min(float(long_horizon), long_fixtures)),
+                    next_expected_points=next_points,
+                    short_minutes_probability=float(np.clip(minutes_share, 0.0, 1.0)),
+                    long_minutes_probability=float(np.clip(minutes_share, 0.0, 1.0)),
+                    form_signal=float(np.clip(form_acceleration / 3.0, -1.0, 1.0)),
+                    role_security=float(np.clip(minutes_share, 0.0, 1.0)),
+                    injury_risk=float(np.clip(1.0 - minutes_share, 0.0, 1.0)),
+                    rotation_risk=float(np.clip(0.5 * (1.0 - minutes_share), 0.0, 1.0)),
+                    price_change_risk=float(np.clip(abs(price_change) / 2.0, 0.0, 1.0)),
+                    uncertainty=float(np.clip(1.0 / max(1.0, np.sqrt(5.0)), 0.0, 1.0)),
+                    captain_upside=float(np.clip(next_points / 8.0, 0.0, 1.0)),
+                    short_price_signal=float(np.clip(price_change / 2.0, -1.0, 1.0)),
+                    long_price_signal=float(np.clip(price_change / 2.0, -1.0, 1.0)),
+                    news_risk=float(np.clip(news_risk, 0.0, 1.0)),
+                    social_sentiment=float(np.clip(social_sentiment, -1.0, 1.0)),
+                    trigger="extended historical forecast",
+                    note="forecast layer bridged into the legal simulator; news/social are zero without timestamped context",
+                )
+            )
+        result[gameweek] = signals
+    return result
+
+
 def selling_price_tenths(purchase_price_tenths: int, current_price_tenths: int) -> int:
     """Apply FPL's half-profit, rounded-down selling-price rule."""
 
@@ -877,65 +961,37 @@ def _chip_transfer_plan(
     bank_tenths: int,
     signals: list[PlayerSignal],
     recommendations: Iterable[TransferRecommendation],
-    max_depth: int = 2,
+    max_depth: int = 15,
 ) -> tuple[TransferRecommendation, ...]:
-    """Create a cheap, sequentially legal chip plan."""
+    """Create a sequentially legal wildcard/free-hit plan.
 
-    selected: list[TransferRecommendation] = []
-    used_out: set[str] = set()
-    used_in: set[str] = set()
-    ordered = sorted(
-        recommendations,
-        key=lambda item: (item.combined_score, item.short_gain + item.long_gain),
-        reverse=True,
-    )
-    for recommendation in ordered:
-        if recommendation.player_out_id in used_out or recommendation.player_in_id in used_in:
-            continue
-        selected.append(recommendation)
-        used_out.add(recommendation.player_out_id)
-        used_in.add(recommendation.player_in_id)
-        if len(selected) >= max_depth:
-            break
-    if len(selected) < 1 or max_depth < 2:
-        return tuple(selected)
+    These chips can replace more than one player.  Reusing the normal transfer
+    beam means every step rechecks selling price, bank, team caps, positions,
+    and the already-selected in/out set.  The default depth is the full
+    15-player squad; callers can lower it for faster counterfactual sweeps.
+    """
 
-    # Recompute the second move after applying the first. This is necessary
-    # because selling value, bank, team caps, and the owned-player set change.
-    try:
-        next_squad, next_purchase, next_bank = _apply_transfer(
-            selected[0],
-            list(squad_ids),
-            dict(purchase_prices),
-            current,
-            gameweek,
-            bank_tenths,
-        )
-    except ValueError:
-        return (selected[0],)
-    current_states, buyable = _states_for_decision(
-        current, gameweek, next_squad, next_purchase, next_bank
-    )
-    second_config = _policy_config(
-        "points_only_free_only",
-        3,
-        8,
+    # ``recommendations`` seeds the first-step candidate pool indirectly via
+    # the same current-state scorer used by ordinary transfers.  The helper
+    # recomputes each subsequent step, which is essential after the first
+    # sale changes both bank and squad composition.
+    del recommendations
+    bundle = _choose_transfer_bundle(
+        current,
+        gameweek,
+        squad_ids,
+        purchase_prices,
+        bank_tenths,
         free_transfers=15,
-        bank_tenths=next_bank,
+        signals=signals,
+        policy="points_only_free_only",
+        short_horizon=3,
+        long_horizon=8,
+        max_transfers=max_depth,
+        beam_width=12,
+        candidate_width=18,
     )
-    second_recommendations = recommend_transfers(
-        current_states,
-        buyable,
-        signals,
-        second_config,
-    )
-    for recommendation in second_recommendations:
-        if recommendation.player_out_id == selected[0].player_out_id:
-            continue
-        if recommendation.player_in_id == selected[0].player_in_id:
-            continue
-        return (selected[0], recommendation)
-    return tuple(selected)
+    return tuple(bundle)
 
 
 def _chip_forecast_deltas(
