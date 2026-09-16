@@ -220,6 +220,10 @@ across four openings), still 224 points below the target. The direct-horizon
 neural and price-aware variants are retained as inspectable research outputs;
 they are not evidence of a winning strategy by themselves.
 
+The optional `--starting-modes ... forecast` stress test adds a legal
+forecast-optimized opening squad. It reached 2,162 points on 2025/26, below
+the four-family ridge result, so it is not part of the default benchmark.
+
 ## License
 
 MIT. This is an independent research tool and is not affiliated with the Premier League or Fantasy Premier League.

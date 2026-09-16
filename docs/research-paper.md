@@ -216,6 +216,13 @@ without direct horizons scored 1,994.25 mean and 2,035 best; price forecasts
 are therefore retained as an available feature, not assumed to improve
 decisions.
 
+As a starting-squad stress test, an optional forecast-optimized legal opening
+family was added to the same ridge bridge. It scored 2,162 on 2025–26 versus
+1,929 for its free-transfer anchor, but its validation action error was worse
+than the four-family run and it did not beat the 2,189 best. This supports
+reporting opening-squad sensitivity explicitly rather than selecting the
+most favorable starting family after seeing the test season.
+
 The result also illustrates why “the neural network scored more on average” is
 not enough. The action space is path-dependent, chip timing has opportunity
 cost, and model errors compound over a season. A strategy can win a few
