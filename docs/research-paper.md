@@ -257,7 +257,8 @@ points versus 2,008.5 for the anchor. Its four opening results were 2,088,
 2,156, 2,046, and 2,015; the anchor results were 2,028, 2,073, 2,034, and
 1,899. The best neural opening scored 2,156, which is 257 points below the
 2,413 research target. This is one held-out season with synthetic opening
-squads, so the artifact is not promoted to the public MCP champion.
+squads, so the artifact is exposed as an MCP backtest research candidate but
+is not promoted to the live default champion.
 
 The anchored cocktail averaged 2,020.75 on the untouched 2025–26 test and
 peaked at 2,092. The earlier ridge bridge reached 2,189 in its best opening

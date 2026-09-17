@@ -288,9 +288,32 @@ On the untouched 2025/26 test it scored:
 The patient candidate clears the 2,413 target in this strict held-out replay.
 Its 2024/25 validation score was 2,357, so the opening rule was checked on a
 prior season before the final test was read. This is the strongest current
-research candidate, not yet the shipped MCP champion: it is one held-out
-season, the external benchmark is not independently reproduced byte-for-byte,
-and the exact historical elite-manager alternative archive remains incomplete.
+research candidate. It is now exposed through the installed MCP's
+`fpl_backtest_strategy` tool; it is not silently made the live default because
+the published score uses one forecast-optimized opening family rather than a
+distribution of random starts.
+
+Run the same candidate through the MCP season simulator with:
+
+```json
+{
+  "history_root": "/path/to/data/vaastav",
+  "season": "2025-26",
+  "previous_season": "2024-25",
+  "forecast_model": "external_hgb",
+  "candidates": [
+    {
+      "name": "published_research_candidate",
+      "policy": "patient_chips",
+      "initial_squad_modes": ["forecast"]
+    }
+  ]
+}
+```
+
+The binary rebuilds the forecast walk-forward from all seasons before the test
+season, so this path is part of the MCP rather than a results-only artifact.
+The exact historical elite-manager alternative archive remains incomplete.
 
 The context files are optional. Each event must carry a publication timestamp;
 archived events also carry the snapshot `observed_at` timestamp. The live

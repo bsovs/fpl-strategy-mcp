@@ -247,6 +247,10 @@ the forecast architecture is an independent local fallback rather than a
 byte-for-byte reproduction of the public LightGBM artifact, the candidate
 uses one forecast-optimized opening family, and the local elite-manager
 archive is still incomplete for pre-2025/26 weekly alternatives and actions.
+The candidate is now exposed through `fpl_backtest_strategy` with
+`forecast_model="external_hgb"`, `policy="patient_chips"`, and
+`initial_squad_modes=["forecast"]`; it remains a research candidate rather
+than the live default until multi-start validation is complete.
 The artifact is `runs/action-policy-external-hgb-forecast-v1/metrics.json`.
 
 ## Missing data that matters most

@@ -1,0 +1,24 @@
+{
+  "name": "external_hgb_patient_chips",
+  "display_name": "External-style forecast + patient chips",
+  "status": "research_candidate",
+  "backtest_contract": {
+    "tool": "fpl_backtest_strategy",
+    "forecast_model": "external_hgb",
+    "policy": "patient_chips",
+    "initial_squad_mode": "forecast"
+  },
+  "results": {
+    "validation_season": "2024-25",
+    "validation_points": 2357,
+    "test_season": "2025-26",
+    "test_points": 2486,
+    "test_transfers": 37,
+    "test_paid_hits": 0
+  },
+  "caveats": [
+    "The published score used one forecast-optimized opening family, not a uniform random-start distribution.",
+    "The external-style HGB forecast is a local reproduction of the public architecture, not a byte-for-byte LightGBM artifact.",
+    "Re-run across additional starting squads before treating the candidate as a production guarantee."
+  ]
+}

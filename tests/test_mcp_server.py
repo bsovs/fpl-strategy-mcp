@@ -14,6 +14,7 @@ from fpl_strategy_mcp.server import (
     _state_from_arguments,
     _strategy_catalog,
     _strategy_info,
+    TOOLS,
 )
 
 
@@ -46,6 +47,18 @@ class MCPServerTests(unittest.TestCase):
         self.assertIsNotNone(model)
         self.assertTrue(path.endswith("action-policy-model.joblib"))
         self.assertIsNone(error)
+
+    def test_published_research_candidate_is_exposed_by_mcp(self):
+        info = _strategy_info()
+        candidate = info["research_candidate"]
+        self.assertEqual(candidate["name"], "external_hgb_patient_chips")
+        self.assertEqual(candidate["results"]["test_points"], 2486)
+        tool = next(item for item in TOOLS if item["name"] == "fpl_backtest_strategy")
+        policy_enum = tool["inputSchema"]["properties"]["policy"]["enum"]
+        mode_enum = tool["inputSchema"]["properties"]["initial_squad_modes"]["items"]["enum"]
+        self.assertIn("patient_chips", policy_enum)
+        self.assertIn("forecast", mode_enum)
+        self.assertIn("external_hgb", tool["inputSchema"]["properties"]["forecast_model"]["enum"])
 
     def test_setup_preserves_claude_config_and_creates_backup(self):
         with TemporaryDirectory() as directory:

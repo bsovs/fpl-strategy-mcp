@@ -42,7 +42,7 @@ sys.path.insert(0, str(SOURCE_ROOT))
 sys.path.insert(0, str(ROOT))
 
 SERVER_NAME = "fpl-strategy"
-SERVER_VERSION = "0.1.7"
+SERVER_VERSION = "0.1.8"
 PROTOCOL_VERSION = "2024-11-05"
 PACKAGE_ASSETS = Path(__file__).resolve().parent / "assets"
 DEFAULT_MODEL = ROOT / "assets" / "action-policy-model.joblib"
@@ -391,6 +391,91 @@ def _load_model(path_value: str | None = None):
         return None, key, f"model at {path} is not an action-value policy model"
     _MODEL_CACHE[key] = model
     return model, key, None
+
+
+def _research_candidate_manifest() -> dict[str, Any]:
+    """Return the strongest research candidate shipped with the repository."""
+
+    path = _asset_path("research-candidate.json")
+    if not path.exists():
+        return {
+            "name": "external_hgb_patient_chips",
+            "status": "not_bundled",
+            "error": f"missing research candidate manifest: {path}",
+        }
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"name": "external_hgb_patient_chips", "status": "invalid", "error": str(exc)}
+    return payload if isinstance(payload, dict) else {
+        "name": "external_hgb_patient_chips",
+        "status": "invalid",
+        "error": "research candidate manifest must be a JSON object",
+    }
+
+
+def _season_sort_key(season: str) -> int:
+    try:
+        return int(str(season).split("-")[0])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid season name: {season!r}") from exc
+
+
+def _build_research_signal_cache(
+    history_root: str,
+    season: str,
+    previous_season: str | None,
+    forecast_model: str,
+):
+    """Build the walk-forward forecast cache used by the published candidate.
+
+    The 2,486-point artifact was fit on every season before 2025/26, not just
+    the immediately preceding season. Keeping this construction behind the MCP
+    backtest tool makes the published candidate reproducible without bundling a
+    platform-specific LightGBM runtime or a stale forecast CSV.
+    """
+
+    if forecast_model != "external_hgb":
+        raise ValueError("the published research candidate currently requires forecast_model='external_hgb'")
+    from fpl_lab.benchmark_forecast import (
+        build_benchmark_feature_table,
+        build_gameweek_forecast_rows,
+        fit_benchmark_forecast_models,
+    )
+    from fpl_lab.player_models import load_vaastav_gameweeks
+    from fpl_lab.simulator import build_model_signal_cache, build_season_data
+
+    root = Path(history_root).expanduser().resolve()
+    available = sorted(
+        [path.name for path in root.iterdir() if path.is_dir() and (path / "gws").exists()],
+        key=_season_sort_key,
+    )
+    target = str(season)
+    if target not in available:
+        raise ValueError(f"season {target!r} is not available under {root}")
+    prior = [candidate for candidate in available if _season_sort_key(candidate) < _season_sort_key(target)]
+    if not prior:
+        raise ValueError("external_hgb requires at least one prior season for walk-forward fitting")
+    selected_previous = str(previous_season) if previous_season else prior[-1]
+    if selected_previous not in available or _season_sort_key(selected_previous) >= _season_sort_key(target):
+        raise ValueError("previous_season must be an available season before season")
+
+    seasons = [*prior, target]
+    raw = load_vaastav_gameweeks(str(root), seasons)
+    current = build_season_data(raw, target)
+    previous = build_season_data(raw, selected_previous)
+    feature_frame = build_benchmark_feature_table(raw, root)
+    train = feature_frame[feature_frame["season"].map(_season_sort_key) < _season_sort_key(target)].copy()
+    target_frame = feature_frame[feature_frame["season"].eq(target)].copy()
+    models = fit_benchmark_forecast_models(train)
+    forecast_rows = build_gameweek_forecast_rows(target_frame, models)
+    signal_cache = build_model_signal_cache(current, forecast_rows)
+    return current, previous, signal_cache, {
+        "forecast_model": forecast_model,
+        "forecast_training_seasons": prior,
+        "forecast_rows": int(len(forecast_rows)),
+        "signal_source": "walk_forward_external_hgb",
+    }
 
 
 def _dataclass_rows(rows: Any, cls):
@@ -1252,18 +1337,41 @@ def _season_backtest(arguments: dict[str, Any]) -> dict[str, Any]:
     if not history_root or not season:
         raise ValueError("season backtest requires history_root and season")
     previous_season = arguments.get("previous_season")
-    seasons = [str(season)] + ([str(previous_season)] if previous_season else [])
-    raw = load_vaastav_gameweeks(history_root, seasons)
-    current = build_season_data(raw, str(season))
-    previous = build_season_data(raw, str(previous_season)) if previous_season else None
-    signal_cache = build_signal_cache(current, previous)
     candidates = arguments.get("candidates") or [{"name": str(arguments.get("policy", "points_only_free_only"))}]
     if not isinstance(candidates, list) or not candidates:
         raise ValueError("candidates must be a non-empty list")
-    rows = []
-    for index, raw_candidate in enumerate(candidates):
+    for raw_candidate in candidates:
         if not isinstance(raw_candidate, dict):
             raise ValueError("each season backtest candidate must be an object")
+
+    requested_modes = list(arguments.get("initial_squad_modes", ["points"]))
+    if not requested_modes:
+        raise ValueError("initial_squad_modes must be a non-empty list")
+    candidate_mode_lists = []
+    for raw_candidate in candidates:
+        candidate_modes = raw_candidate.get("initial_squad_modes", requested_modes)
+        if not isinstance(candidate_modes, list) or not candidate_modes:
+            raise ValueError("initial_squad_modes must be a non-empty list")
+        candidate_mode_lists.append(candidate_modes)
+    forecast_requested = bool(arguments.get("forecast_model")) or any(
+        "forecast" in modes for modes in candidate_mode_lists
+    )
+    forecast_meta = {"signal_source": "historical_legacy_signals"}
+    if forecast_requested:
+        current, previous, signal_cache, forecast_meta = _build_research_signal_cache(
+            str(history_root),
+            str(season),
+            str(previous_season) if previous_season else None,
+            str(arguments.get("forecast_model", "external_hgb")),
+        )
+    else:
+        seasons = [str(season)] + ([str(previous_season)] if previous_season else [])
+        raw = load_vaastav_gameweeks(history_root, seasons)
+        current = build_season_data(raw, str(season))
+        previous = build_season_data(raw, str(previous_season)) if previous_season else None
+        signal_cache = build_signal_cache(current, previous)
+    rows = []
+    for index, raw_candidate in enumerate(candidates):
         policy = str(raw_candidate.get("policy", arguments.get("policy", "points_only_free_only")))
         model = None
         if policy in {"neural", "cocktail"}:
@@ -1276,10 +1384,13 @@ def _season_backtest(arguments: dict[str, Any]) -> dict[str, Any]:
         cocktail_config = CocktailConfig(
             **{key: value for key, value in cocktail_payload.items() if key in CocktailConfig.__dataclass_fields__}
         )
-        modes = raw_candidate.get("initial_squad_modes", arguments.get("initial_squad_modes", ["points"]))
+        modes = raw_candidate.get("initial_squad_modes", requested_modes)
         if not isinstance(modes, list) or not modes:
             raise ValueError("initial_squad_modes must be a non-empty list")
         for mode_index, mode in enumerate(modes):
+            mode = str(mode)
+            if mode == "forecast" and not forecast_requested:
+                raise ValueError("initial_squad_mode='forecast' requires forecast_model='external_hgb'")
             result = simulate_season(
                 current,
                 previous,
@@ -1292,12 +1403,17 @@ def _season_backtest(arguments: dict[str, Any]) -> dict[str, Any]:
                 end_gameweek=arguments.get("end_gameweek"),
                 initial_free_transfers=int(arguments.get("initial_free_transfers", 0)),
                 cocktail_config=cocktail_config,
+                max_transfer_depth=int(arguments.get("max_transfer_depth", 3)),
+                transfer_beam_width=int(arguments.get("transfer_beam_width", 12)),
+                transfer_candidate_width=int(arguments.get("transfer_candidate_width", 18)),
+                chip_transfer_depth=int(arguments.get("chip_transfer_depth", 15)),
             )
             rows.append(
                 {
                     "candidate": str(raw_candidate.get("name", f"candidate_{index + 1}")),
                     "policy": policy,
-                    "initial_squad_mode": str(mode),
+                    "initial_squad_mode": mode,
+                    "initial_squad_seed": int(arguments.get("seed", 0)) + mode_index,
                     "season": result.season,
                     "gross_points": result.gross_points,
                     "hit_points": result.hit_points,
@@ -1309,19 +1425,29 @@ def _season_backtest(arguments: dict[str, Any]) -> dict[str, Any]:
                     "gameweeks": result.gameweeks,
                     "chip_uses": result.chip_uses,
                     "chips_remaining": list(result.chips_remaining),
+                    "signal_source": forecast_meta["signal_source"],
                 }
             )
     rows.sort(key=lambda row: row["net_points"], reverse=True)
+    research_candidate = (
+        str(arguments.get("forecast_model", "")) == "external_hgb"
+        and any(row["policy"] == "patient_chips" and row["initial_squad_mode"] == "forecast" for row in rows)
+    )
     return {
         "kind": "season_simulator",
         "season": str(season),
         "history_root": str(history_root),
         "player_snapshot_gameweeks": len(current.snapshots_by_gw),
+        "forecast": forecast_meta,
+        "research_candidate": research_candidate,
         "results": rows,
         "warnings": [
             "This is a historical simulator, not a guarantee of future performance.",
             "Use separate development and final test seasons/starting squads when tuning cocktail_config.",
             "Vaastav-format data is expected to be point-in-time player GW history; context/news ingestion is not inferred from future rows.",
+            *([
+                "The external_hgb/patient_chips result is the published research candidate; reproduce it across additional starting squads before treating it as a production guarantee.",
+            ] if research_candidate else []),
         ],
     }
 
@@ -1346,6 +1472,7 @@ def _strategy_info() -> dict[str, Any]:
         "version": SERVER_VERSION,
         "default_strategy": "champion",
         "available_strategies": ["champion", *sorted(HYBRID_PROFILES)],
+        "research_candidate": _research_candidate_manifest(),
         "development_selected_strategy": selected.get("strategy", "hybrid_win"),
         "action_cocktail_champion": champion,
         "action_cocktail_holdout_summary": cocktail.get("holdout_summary", []),
@@ -1365,6 +1492,7 @@ def _strategy_info() -> dict[str, Any]:
             "live lineup selection is forecast-based; final autosubs depend on confirmed minutes and late team news",
             "the frozen champion is currently the free-transfer points anchor because no learned override cleared the paired temporal guardrail",
             "model quality is not proven against global FPL winners",
+            "the external_hgb research candidate requires a local historical archive for walk-forward forecast rebuilding; it is exposed through fpl_backtest_strategy and is not silently substituted for live current-season signals",
         ],
         "research_sources": [
             "https://www.premierleague.com/en/news/2632794",
@@ -1529,7 +1657,7 @@ TOOLS = [
     },
     {
         "name": "fpl_backtest_strategy",
-        "description": "Backtest and compare tunable strategies. Use scenarios/scenarios_path for point-in-time replay with realized action_outcomes, or history_root plus season for the legal Vaastav-format season simulator. Returns mean utility, points, hold rate, regret to the supplied oracle, action counts, and per-scenario details.",
+        "description": "Backtest and compare tunable strategies. Use scenarios/scenarios_path for point-in-time replay with realized action_outcomes, or history_root plus season for the legal Vaastav-format season simulator. To reproduce the published 2,486-point research candidate, use forecast_model=external_hgb, policy=patient_chips, and initial_squad_modes=[forecast].",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1542,12 +1670,17 @@ TOOLS = [
                 "history_root": {"type": "string", "description": "Root of Vaastav-format season folders when running the full simulator."},
                 "season": {"type": "string"},
                 "previous_season": {"type": "string"},
-                "policy": {"type": "string", "enum": ["hold", "points_only", "points_only_free_only", "price_aware", "chase", "neural", "cocktail"]},
-                "initial_squad_modes": {"type": "array", "items": {"type": "string", "enum": ["points", "value", "template", "randomized_points"]}},
+                "policy": {"type": "string", "enum": ["hold", "points_only", "points_only_free_only", "price_aware", "chase", "neural", "cocktail", "patient_chips"]},
+                "initial_squad_modes": {"type": "array", "items": {"type": "string", "enum": ["points", "value", "template", "randomized_points", "forecast"]}},
+                "forecast_model": {"type": "string", "enum": ["external_hgb"], "description": "Walk-forward forecast family used by the published research candidate. Requires history_root and at least one prior season."},
                 "cocktail_config": {"type": "object"},
                 "start_gameweek": {"type": "integer", "minimum": 1, "maximum": 38},
                 "end_gameweek": {"type": "integer", "minimum": 1, "maximum": 38},
                 "seed": {"type": "integer", "default": 0},
+                "max_transfer_depth": {"type": "integer", "minimum": 1, "maximum": 5, "default": 3},
+                "transfer_beam_width": {"type": "integer", "minimum": 1, "maximum": 50, "default": 12},
+                "transfer_candidate_width": {"type": "integer", "minimum": 1, "maximum": 100, "default": 18},
+                "chip_transfer_depth": {"type": "integer", "minimum": 1, "maximum": 50, "default": 15},
                 "model_path": {"type": "string"},
             },
         },
