@@ -90,6 +90,7 @@ class PolicyAction:
     player_out_id: str = ""
     player_in_id: str = ""
     hit_cost: float = 0.0
+    transfer_count: int = 0
     short_points_delta: float = 0.0
     long_points_delta: float = 0.0
     short_price_delta: float = 0.0

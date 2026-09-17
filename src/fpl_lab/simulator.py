@@ -31,6 +31,72 @@ INITIAL_SQUAD_MODES = ("points", "value", "template", "randomized_points")
 CHIP_KINDS = ("wildcard", "free_hit", "bench_boost", "triple_captain")
 
 
+def chip_kind(token: str) -> str | None:
+    """Return the canonical chip kind for a legacy or season-token name."""
+
+    value = str(token)
+    if value in CHIP_KINDS:
+        return value
+    for kind in CHIP_KINDS:
+        if value.startswith(f"{kind}_") and value[len(kind) + 1 :].isdigit():
+            return kind
+    return None
+
+
+def chip_tokens_for_season(season: str) -> tuple[str, ...]:
+    """Return the season-versioned chip inventory.
+
+    From 2024/25 FPL supplied two copies of each major chip, one usable in
+    each half of the season. Earlier seasons use one copy of each chip.
+    """
+
+    if season >= "2024-25":
+        return tuple(f"{kind}_{half}" for half in (1, 2) for kind in CHIP_KINDS)
+    return CHIP_KINDS
+
+
+def chip_token_usable(token: str, gameweek: int) -> bool:
+    """Whether a chip token can be played in this gameweek."""
+
+    value = str(token)
+    if value.endswith("_1"):
+        return int(gameweek) <= 19
+    if value.endswith("_2"):
+        return int(gameweek) >= 20
+    return True
+
+
+def available_chip_kinds(
+    chips_available: Iterable[str],
+    gameweek: int | None = None,
+) -> set[str]:
+    """Collapse chip tokens to canonical kinds that are currently usable."""
+
+    kinds: set[str] = set()
+    for token in chips_available:
+        kind = chip_kind(str(token))
+        if kind is None:
+            continue
+        if gameweek is None or chip_token_usable(str(token), gameweek):
+            kinds.add(kind)
+    return kinds
+
+
+def chip_token_for_use(
+    chips_available: Iterable[str],
+    kind: str,
+    gameweek: int,
+) -> str | None:
+    """Select and return the concrete inventory token consumed by a chip."""
+
+    candidates = sorted(
+        str(token)
+        for token in chips_available
+        if chip_kind(str(token)) == kind and chip_token_usable(str(token), gameweek)
+    )
+    return candidates[0] if candidates else None
+
+
 def _finite_float(value: object, default: float = 0.0) -> float:
     """Convert a feature to a finite float without letting NaN enter policy state."""
 
@@ -86,6 +152,7 @@ class SeasonRules:
     hit_cost: float = 4.0
     budget_tenths: int = 1000
     max_players_per_team: int = 3
+    chip_tokens: tuple[str, ...] = CHIP_KINDS
 
 
 @dataclass
@@ -120,8 +187,12 @@ class PolicyActionCandidate:
 def season_rules(season: str) -> SeasonRules:
     """Return the historical transfer-cap rule used by the season."""
 
-    # FPL raised the banked-transfer cap from two to five for 2024/25.
-    return SeasonRules(free_transfer_cap=5 if season >= "2024-25" else 2)
+    # FPL raised the banked-transfer cap from two to five for 2024/25 and
+    # introduced one copy of each major chip in each half of the season.
+    return SeasonRules(
+        free_transfer_cap=5 if season >= "2024-25" else 2,
+        chip_tokens=chip_tokens_for_season(season),
+    )
 
 
 def _position(value: object) -> str:
@@ -1051,6 +1122,7 @@ def _choose_transfer_bundle(
     max_transfers: int = 3,
     beam_width: int = 12,
     candidate_width: int = 18,
+    minimum_utility: float = 0.25,
 ) -> list:
     """Search a small legal transfer beam, including optional hits."""
 
@@ -1106,7 +1178,7 @@ def _choose_transfer_bundle(
         beam = expanded[:beam_width]
         if beam[0][-1] > best[-1]:
             best = beam[0]
-    if best[-1] <= 0.25:
+    if best[-1] <= minimum_utility:
         return []
     return best[3]
 
@@ -1129,7 +1201,9 @@ def policy_state_from_runtime(
         if current.snapshot(player_id, gameweek) is not None
     )
     last_gameweek = max(current.snapshots_by_gw)
-    available = set(CHIP_KINDS if chips_available is None else chips_available)
+    rules = season_rules(current.season)
+    available = set(rules.chip_tokens if chips_available is None else chips_available)
+    usable_kinds = available_chip_kinds(available, gameweek)
     signal_by_id = {signal.player_id: signal for signal in (signals or ())}
     squad_signals = [signal_by_id[player_id] for player_id in ids if player_id in signal_by_id]
     if squad_signals:
@@ -1156,11 +1230,11 @@ def policy_state_from_runtime(
         bank=bank_tenths / 10.0,
         free_transfers=free_transfers,
         squad_value=squad_value,
-        chip_flexibility=len(available) / len(CHIP_KINDS),
-        wildcard_available="wildcard" in available,
-        free_hit_available="free_hit" in available,
-        bench_boost_available="bench_boost" in available,
-        triple_captain_available="triple_captain" in available,
+        chip_flexibility=len(available) / len(rules.chip_tokens),
+        wildcard_available="wildcard" in usable_kinds,
+        free_hit_available="free_hit" in usable_kinds,
+        bench_boost_available="bench_boost" in usable_kinds,
+        triple_captain_available="triple_captain" in usable_kinds,
         squad_minutes_probability=squad_minutes_probability,
         squad_news_risk=squad_news_risk,
         squad_context_reliability=squad_context_reliability,
@@ -1181,6 +1255,7 @@ def recommendation_to_policy_action(
         player_out_id=recommendation.player_out_id,
         player_in_id=recommendation.player_in_id,
         hit_cost=recommendation.hit_cost,
+        transfer_count=1,
         short_points_delta=recommendation.short_gain,
         long_points_delta=recommendation.long_gain,
         short_price_delta=signal_in.short_price_signal - signal_out.short_price_signal,
@@ -1202,6 +1277,96 @@ def recommendation_to_policy_action(
         uncertainty_delta=signal_in.uncertainty - signal_out.uncertainty,
         legal=True,
     )
+
+
+def _bundle_to_policy_action(
+    bundle: Iterable[TransferRecommendation],
+    signals: dict[str, PlayerSignal],
+    free_transfers: int,
+) -> PolicyAction:
+    """Aggregate a legal ordinary transfer bundle into one action candidate."""
+
+    recommendations = tuple(bundle)
+    if not recommendations:
+        raise ValueError("cannot encode an empty transfer bundle")
+    action = PolicyAction(
+        kind="transfer",
+        player_out_id="|".join(item.player_out_id for item in recommendations),
+        player_in_id="|".join(item.player_in_id for item in recommendations),
+        hit_cost=max(0.0, len(recommendations) - int(free_transfers)) * 4.0,
+        transfer_count=len(recommendations),
+        short_points_delta=sum(item.short_gain for item in recommendations),
+        long_points_delta=sum(item.long_gain for item in recommendations),
+        short_price_delta=sum(
+            signals[item.player_in_id].short_price_signal - signals[item.player_out_id].short_price_signal
+            for item in recommendations
+        ),
+        long_price_delta=sum(
+            signals[item.player_in_id].long_price_signal - signals[item.player_out_id].long_price_signal
+            for item in recommendations
+        ),
+        short_fixture_delta=sum(
+            signals[item.player_in_id].short_fixture_delta - signals[item.player_out_id].short_fixture_delta
+            for item in recommendations
+        ),
+        long_fixture_delta=sum(
+            signals[item.player_in_id].long_fixture_delta - signals[item.player_out_id].long_fixture_delta
+            for item in recommendations
+        ),
+        form_delta=sum(
+            signals[item.player_in_id].form_signal - signals[item.player_out_id].form_signal
+            for item in recommendations
+        ),
+        value_delta=sum(
+            signals[item.player_in_id].value_signal - signals[item.player_out_id].value_signal
+            for item in recommendations
+        ),
+        role_security_delta=sum(
+            signals[item.player_in_id].role_security - signals[item.player_out_id].role_security
+            for item in recommendations
+        ),
+        price_change_risk_delta=sum(
+            signals[item.player_in_id].price_change_risk - signals[item.player_out_id].price_change_risk
+            for item in recommendations
+        ),
+        sell_loss=sum(item.unrealized_loss for item in recommendations),
+        ownership_leverage_delta=sum(
+            signals[item.player_in_id].ownership_leverage - signals[item.player_out_id].ownership_leverage
+            for item in recommendations
+        ),
+        short_minutes_delta=sum(
+            signals[item.player_in_id].short_minutes_probability
+            - signals[item.player_out_id].short_minutes_probability
+            for item in recommendations
+        ),
+        long_minutes_delta=sum(
+            signals[item.player_in_id].long_minutes_probability
+            - signals[item.player_out_id].long_minutes_probability
+            for item in recommendations
+        ),
+        news_risk_delta=sum(
+            signals[item.player_in_id].news_risk - signals[item.player_out_id].news_risk
+            for item in recommendations
+        ),
+        set_piece_delta=sum(
+            signals[item.player_in_id].set_piece_signal - signals[item.player_out_id].set_piece_signal
+            for item in recommendations
+        ),
+        transfer_role_delta=sum(
+            signals[item.player_in_id].transfer_role_signal - signals[item.player_out_id].transfer_role_signal
+            for item in recommendations
+        ),
+        context_reliability_delta=sum(
+            signals[item.player_in_id].context_reliability - signals[item.player_out_id].context_reliability
+            for item in recommendations
+        ),
+        uncertainty_delta=sum(
+            signals[item.player_in_id].uncertainty - signals[item.player_out_id].uncertainty
+            for item in recommendations
+        ),
+        legal=True,
+    )
+    return action
 
 
 def _chip_transfer_plan(
@@ -1306,7 +1471,10 @@ def build_neural_action_candidates(
             recommendations.setdefault(
                 (recommendation.player_out_id, recommendation.player_in_id), recommendation
             )
-    available_chips = set(CHIP_KINDS if chips_available is None else chips_available)
+    available_chips = set(
+        season_rules(current.season).chip_tokens if chips_available is None else chips_available
+    )
+    usable_chip_kinds = available_chip_kinds(available_chips, gameweek)
     candidates: list[PolicyActionCandidate] = [PolicyActionCandidate(action=PolicyAction(kind="hold"))]
     for recommendation in sorted(
         recommendations.values(), key=lambda item: (item.player_out_id, item.player_in_id)
@@ -1315,6 +1483,37 @@ def build_neural_action_candidates(
             PolicyActionCandidate(
                 action=recommendation_to_policy_action(recommendation, signal_by_id),
                 transfer_bundle=(recommendation,),
+            )
+        )
+    # Ordinary multi-transfer weeks are distinct from wildcard/free-hit
+    # bundles: they consume free transfers and may incur hits. Expose the best
+    # legal bundle from each scoring family so the action learner can learn
+    # when a second/third swap is worth the transfer cost.
+    bundle_candidates: dict[tuple[str, ...], tuple[TransferRecommendation, ...]] = {}
+    for bundle_policy in ("points_only", "price_aware", "chase"):
+        bundle = _choose_transfer_bundle(
+            current,
+            gameweek,
+            squad_ids,
+            purchase_prices,
+            bank_tenths,
+            free_transfers=free_transfers,
+            signals=signals,
+            policy=bundle_policy,
+            short_horizon=3,
+            long_horizon=8,
+            max_transfers=min(3, max(1, free_transfers + 1)),
+            beam_width=6,
+            candidate_width=candidate_width,
+        )
+        if len(bundle) > 1:
+            key = tuple(f"{item.player_out_id}>{item.player_in_id}" for item in bundle)
+            bundle_candidates[key] = tuple(bundle)
+    for bundle in bundle_candidates.values():
+        candidates.append(
+            PolicyActionCandidate(
+                action=_bundle_to_policy_action(bundle, signal_by_id, free_transfers),
+                transfer_bundle=bundle,
             )
         )
     chip_bundle = _chip_transfer_plan(
@@ -1326,9 +1525,9 @@ def build_neural_action_candidates(
         signals,
         recommendations.values(),
         max_depth=chip_transfer_depth,
-    ) if available_chips.intersection({"wildcard", "free_hit"}) else ()
+    ) if usable_chip_kinds.intersection({"wildcard", "free_hit"}) else ()
     for chip in CHIP_KINDS:
-        if chip not in available_chips:
+        if chip not in usable_chip_kinds:
             continue
         bundle = chip_bundle if chip in {"wildcard", "free_hit"} else ()
         short_delta = sum(recommendation.short_gain for recommendation in bundle)
@@ -1348,6 +1547,7 @@ def build_neural_action_candidates(
         )
         action = PolicyAction(
             kind=chip,
+            transfer_count=len(bundle),
             short_points_delta=short_delta + short_chip,
             long_points_delta=long_delta + long_chip,
             short_price_delta=sum(
@@ -1571,7 +1771,10 @@ def _choose_cocktail_action(
     if neural_policy is None:
         return anchor_candidate
 
-    available_chips = set(CHIP_KINDS if chips_available is None else chips_available)
+    available_chips = set(
+        season_rules(current.season).chip_tokens if chips_available is None else chips_available
+    )
+    usable_chip_kinds = available_chip_kinds(available_chips, gameweek)
     candidates = build_neural_action_candidates(
         current,
         gameweek,
@@ -1615,7 +1818,7 @@ def _choose_cocktail_action(
         if action.kind == "hold":
             continue
         if action.kind in CHIP_KINDS:
-            if not config.allow_chips or action.kind not in available_chips:
+            if not config.allow_chips or action.kind not in usable_chip_kinds:
                 continue
             if not config.min_chip_gameweek <= gameweek <= config.max_chip_gameweek:
                 continue
@@ -1656,6 +1859,42 @@ def _choose_cocktail_action(
     return best_candidate
 
 
+def _choose_patient_chip(
+    current: SeasonData,
+    gameweek: int,
+    squad_ids: list[str],
+    signals: list[PlayerSignal],
+    chips_available: Iterable[str],
+) -> str | None:
+    """Schedule TC/BB at the end of an available chip half.
+
+    This is the local challenger distilled from the public 2,431-point
+    benchmark: do not pay hits, and do not let the two half-season TC/BB slots
+    expire. It is intentionally a deterministic rule, not a holdout-tuned
+    neural decision. Wildcard and Free Hit remain outside this challenger
+    because the benchmark's own backtest found their automation unstable.
+    """
+
+    available = set(chips_available)
+    usable = available_chip_kinds(available, gameweek)
+    eligible = usable.intersection({"bench_boost", "triple_captain"})
+    if not eligible or gameweek < 2:
+        return None
+    tokenized = any(str(token).endswith(("_1", "_2")) for token in available)
+    if tokenized:
+        force_weeks = {18, 19, 37, 38}
+    else:
+        force_weeks = {19, 38}
+    if gameweek not in force_weeks:
+        return None
+    signal_by_id = {signal.player_id: signal for signal in signals}
+    values = {
+        chip: _chip_forecast_deltas(chip, squad_ids, current, gameweek, signal_by_id)[0]
+        for chip in eligible
+    }
+    return max(values, key=values.get)
+
+
 def simulate_season(
     current: SeasonData,
     previous: SeasonData | None,
@@ -1689,7 +1928,16 @@ def simulate_season(
     behavior when they are omitted.
     """
 
-    if policy not in {"hold", "points_only", "points_only_free_only", "price_aware", "chase", "neural", "cocktail"}:
+    if policy not in {
+        "hold",
+        "points_only",
+        "points_only_free_only",
+        "price_aware",
+        "chase",
+        "neural",
+        "cocktail",
+        "patient_chips",
+    }:
         raise ValueError(f"unknown policy: {policy}")
     available_gameweeks = sorted(current.snapshots_by_gw)
     if start_gameweek not in current.snapshots_by_gw:
@@ -1750,11 +1998,13 @@ def simulate_season(
     free_transfers = int(initial_free_transfers)
     if not 0 <= free_transfers <= rules.free_transfer_cap:
         raise ValueError("initial_free_transfers is outside the historical rule cap")
-    chips_available = set(CHIP_KINDS if initial_chips_available is None else initial_chips_available)
-    unknown_chips = chips_available - set(CHIP_KINDS)
+    chips_available = set(
+        rules.chip_tokens if initial_chips_available is None else initial_chips_available
+    )
+    unknown_chips = {token for token in chips_available if chip_kind(str(token)) is None}
     if unknown_chips:
         raise ValueError(f"unknown chips: {sorted(unknown_chips)}")
-    if forced_first_chip is not None and forced_first_chip not in chips_available:
+    if forced_first_chip is not None and chip_token_for_use(chips_available, forced_first_chip, start_gameweek) is None:
         raise ValueError(f"forced chip {forced_first_chip} is unavailable")
     gross_points = 0.0
     hit_points = 0.0
@@ -1790,7 +2040,34 @@ def simulate_season(
             transfer_bundle = list(forced_first_bundle)
             chip_action = forced_first_chip
         elif gameweek >= 2 and policy not in {"hold"}:
-            if policy == "neural":
+            if policy == "patient_chips":
+                chip_action = _choose_patient_chip(
+                    current,
+                    gameweek,
+                    squad_ids,
+                    signals,
+                    chips_available,
+                )
+                # The challenger uses only banked/free transfers. A move must
+                # clear a two-point horizon-utility bar, matching the public
+                # benchmark's patient transfer discipline.
+                transfer_bundle = _choose_transfer_bundle(
+                    current,
+                    gameweek,
+                    squad_ids,
+                    purchase_prices,
+                    bank_tenths,
+                    free_transfers,
+                    signals,
+                    "points_only_free_only",
+                    short_horizon,
+                    long_horizon,
+                    max_transfers=3,
+                    beam_width=12,
+                    candidate_width=18,
+                    minimum_utility=2.0,
+                )
+            elif policy == "neural":
                 neural_action = _choose_neural_action(
                     current,
                     gameweek,
@@ -1840,11 +2117,12 @@ def simulate_season(
                     candidate_width=transfer_candidate_width,
                 )
         if chip_action is not None:
-            if chip_action not in chips_available:
+            chip_token = chip_token_for_use(chips_available, chip_action, gameweek)
+            if chip_token is None:
                 raise ValueError(f"chip {chip_action} was selected after being consumed")
-            if chip_action not in {"wildcard", "free_hit", "bench_boost", "triple_captain"}:
+            if chip_kind(chip_action) not in CHIP_KINDS:
                 raise ValueError(f"unknown chip action: {chip_action}")
-            chips_available.remove(chip_action)
+            chips_available.remove(chip_token)
             chip_uses[chip_action] = chip_uses.get(chip_action, 0) + 1
         if transfer_bundle:
             for transfer in transfer_bundle:

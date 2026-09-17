@@ -10,7 +10,7 @@ season is never used for fitting or model selection.
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
+from collections import Counter, defaultdict
 import json
 from pathlib import Path
 import sys
@@ -30,7 +30,16 @@ from fpl_lab.player_models import (
     build_extended_player_feature_table,
     load_vaastav_gameweeks,
 )
+from fpl_lab.benchmark_forecast import (
+    build_benchmark_feature_table,
+    build_gameweek_forecast_rows,
+    fit_benchmark_forecast_models,
+)
 from fpl_lab.context import ContextStore, load_context_events
+from fpl_lab.elite_managers import (
+    load_observed_manager_transitions,
+    summarize_observed_manager_transitions,
+)
 from fpl_lab.official_archive import OfficialSnapshotStore
 from fpl_lab.policy import ActionValueEnsemble
 from fpl_lab.policy_training import (
@@ -60,10 +69,11 @@ def _distinct_player_gameweeks(frame: pd.DataFrame) -> pd.DataFrame:
 def _forecast_caches(
     raw: pd.DataFrame,
     seasons: list[str],
-    feature_frame: pd.DataFrame,
+    feature_frame: pd.DataFrame | None,
     forecast_model_kind: str = "neural",
     context_store: ContextStore | None = None,
     quality_rows: list[dict[str, Any]] | None = None,
+    benchmark_feature_frame: pd.DataFrame | None = None,
 ) -> dict[str, dict[int, list]]:
     """Build a no-lookahead forecast cache for every requested season."""
 
@@ -77,6 +87,29 @@ def _forecast_caches(
             caches[season] = build_signal_cache(current, previous, context_store=context_store)
             continue
         print(f"  fitting {forecast_model_kind} point/horizon/price models for {season}", flush=True)
+        if forecast_model_kind == "external_hgb":
+            if benchmark_feature_frame is None:
+                raise ValueError("external_hgb requires benchmark_feature_frame")
+            train = benchmark_feature_frame[benchmark_feature_frame["season"].isin(prior_seasons)].copy()
+            target = benchmark_feature_frame[benchmark_feature_frame["season"] == season].copy()
+            benchmark_models = fit_benchmark_forecast_models(train)
+            forecast_rows = build_gameweek_forecast_rows(target, benchmark_models)
+            caches[season] = build_model_signal_cache(current, forecast_rows)
+            if quality_rows is not None:
+                actual = pd.to_numeric(target["total_points"], errors="coerce").to_numpy(float)
+                predicted = benchmark_models.predict_expected_points(target)
+                quality_rows.append(
+                    {
+                        "season": season,
+                        "target": "benchmark_expected_points_per_fixture",
+                        "n": int(len(actual)),
+                        "rmse": float(np.sqrt(np.mean((actual - predicted) ** 2))),
+                        "mae": float(np.mean(np.abs(actual - predicted))),
+                        "actual_mean": float(np.mean(actual)),
+                        "predicted_mean": float(np.mean(predicted)),
+                    }
+                )
+            continue
         train = feature_frame[feature_frame["season"].isin(prior_seasons)].copy()
         target = feature_frame[feature_frame["season"] == season].copy()
         gameweek_train = _distinct_player_gameweeks(train)
@@ -179,6 +212,7 @@ def _collect_examples(
     horizon_gameweeks: int,
     chip_transfer_depth: int,
     starting_modes: tuple[str, ...],
+    label_policy: str,
 ) -> list:
     season_data = {season: build_season_data(raw, season) for season in history_seasons}
     examples = []
@@ -191,7 +225,7 @@ def _collect_examples(
             trajectory = simulate_season(
                 current,
                 previous,
-                policy="points_only_free_only",
+                policy=label_policy,
                 initial_squad_mode=mode,
                 initial_squad_seed=mode_index,
                 signal_cache=caches[season],
@@ -202,13 +236,13 @@ def _collect_examples(
                     current,
                     previous,
                     scenario=f"{season}:{mode}",
-                    behavior_policy="points_only_free_only",
+                    behavior_policy=label_policy,
                     trajectory_log=trajectory.log,
                     signal_cache=caches[season],
                     horizon_gameweeks=horizon_gameweeks,
                     candidate_width=candidate_width,
                     max_states=max_states,
-                    continuation_policy="points_only_free_only",
+                    continuation_policy=label_policy,
                     chip_transfer_depth=chip_transfer_depth,
                 )
             )
@@ -310,13 +344,34 @@ def main() -> None:
     parser.add_argument("--horizon-gameweeks", type=int, default=2)
     parser.add_argument("--training-chip-depth", type=int, default=5)
     parser.add_argument("--test-chip-depth", type=int, default=15)
-    parser.add_argument("--forecast-model", choices=("neural", "ridge"), default="neural")
+    parser.add_argument(
+        "--forecast-model",
+        choices=("neural", "ridge", "external_hgb"),
+        default="neural",
+        help="walk-forward forecast family; external_hgb reproduces the published minutes-plus-conditional-points architecture without LightGBM",
+    )
+    parser.add_argument(
+        "--label-policy",
+        choices=("points_only", "points_only_free_only"),
+        default="points_only",
+        help="legal behavior policy used to generate states and continuations; points_only includes paid hits",
+    )
     parser.add_argument("--news-context", action="append", default=[], help="backdated news JSON/JSONL/CSV; only events before each simulated deadline are used")
     parser.add_argument("--social-context", action="append", default=[], help="backdated social JSON/JSONL/CSV; only events before each simulated deadline are used")
     parser.add_argument(
         "--official-snapshots",
         default=None,
         help="archived bootstrap player snapshots; only the latest row observed before each deadline is used",
+    )
+    parser.add_argument(
+        "--observed-manager-archive",
+        default=None,
+        help="optional weekly manager archive used for held-out behavior auditing only, never model fitting",
+    )
+    parser.add_argument(
+        "--observed-manager-rank-index",
+        default=None,
+        help="rank-band crosswalk for --observed-manager-archive",
     )
     parser.add_argument(
         "--starting-modes",
@@ -357,11 +412,29 @@ def main() -> None:
     )
     if official_snapshot_store is not None:
         print(f"Loaded archived official bootstrap snapshots from {args.official_snapshots}", flush=True)
-    feature_frame = build_extended_player_feature_table(
-        raw,
-        context_store=context_store,
-        official_snapshot_store=official_snapshot_store,
-    )
+    observed_manager_summary = None
+    if args.observed_manager_archive:
+        observed_manager_frame = load_observed_manager_transitions(
+            args.observed_manager_archive,
+            args.observed_manager_rank_index,
+        )
+        observed_manager_summary = summarize_observed_manager_transitions(observed_manager_frame)
+        print(
+            f"Loaded {observed_manager_summary['manager_count']} observed managers "
+            f"for holdout behavior audit only",
+            flush=True,
+        )
+    benchmark_feature_frame = None
+    if args.forecast_model == "external_hgb":
+        print("Building external-style 53-feature forecast table", flush=True)
+        benchmark_feature_frame = build_benchmark_feature_table(raw, history_root)
+        feature_frame = None
+    else:
+        feature_frame = build_extended_player_feature_table(
+            raw,
+            context_store=context_store,
+            official_snapshot_store=official_snapshot_store,
+        )
     cache_seasons = development + [args.validation_season, args.evaluation_season]
     availability_quality: list[dict[str, Any]] = []
     caches = _forecast_caches(
@@ -371,6 +444,7 @@ def main() -> None:
         forecast_model_kind=args.forecast_model,
         context_store=context_store,
         quality_rows=availability_quality,
+        benchmark_feature_frame=benchmark_feature_frame,
     )
     # Keep the action learner exposed to several legal opening families.  The
     # randomized family is seeded per mode so it is reproducible while still
@@ -388,6 +462,7 @@ def main() -> None:
         args.horizon_gameweeks,
         args.training_chip_depth,
         starting_modes,
+        args.label_policy,
     )
     development_targets = counterfactual_target_values(development_examples)
     print(f"Development examples: {len(development_examples):,}", flush=True)
@@ -403,6 +478,7 @@ def main() -> None:
         args.horizon_gameweeks,
         args.training_chip_depth,
         starting_modes,
+        args.label_policy,
     )
     validation_targets = counterfactual_target_values(validation_examples)
     print(f"Validation examples: {len(validation_examples):,}", flush=True)
@@ -458,6 +534,16 @@ def main() -> None:
         args.training_chip_depth,
         policy="cocktail",
     )
+    validation_patient_chips = _simulate_policy(
+        selected_model,
+        raw,
+        args.validation_season,
+        previous_validation,
+        caches[args.validation_season],
+        starting_modes,
+        args.training_chip_depth,
+        policy="patient_chips",
+    )
     test_previous = max(cache_seasons[:-1], key=season_order)
     test_neural = _simulate_policy(
         selected_model,
@@ -489,6 +575,16 @@ def main() -> None:
         args.test_chip_depth,
         policy="cocktail",
     )
+    test_patient_chips = _simulate_policy(
+        selected_model,
+        raw,
+        args.evaluation_season,
+        test_previous,
+        caches[args.evaluation_season],
+        starting_modes,
+        args.test_chip_depth,
+        policy="patient_chips",
+    )
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -499,19 +595,38 @@ def main() -> None:
         record["target"] = target
         records.append(record)
     (output_dir / "counterfactual-examples.json").write_text(json.dumps(records, indent=2) + "\n", encoding="utf-8")
+    if args.forecast_model == "external_hgb":
+        feature_cache_description = (
+            "walk-forward external-style 53-feature minutes classifier plus conditional cameo/60-plus "
+            "point regressors; true fixture team reconstruction and persistent player codes; "
+            "each season uses only prior seasons for fitting"
+        )
+    else:
+        feature_cache_description = (
+            f"walk-forward extended {args.forecast_model} point forecasts, direct 3/8-gameweek forecasts, "
+            "a next-gameweek price-change ridge, and a separate expected-minutes ridge; "
+            "each season uses only prior seasons for fitting"
+        )
     metrics = {
         "development_seasons": development,
         "validation_season": args.validation_season,
         "evaluation_season": args.evaluation_season,
         "target_points": 2413,
-        "feature_cache": (
-            f"walk-forward extended {args.forecast_model} point forecasts, direct 3/8-gameweek forecasts, "
-            "a next-gameweek price-change ridge, and a separate expected-minutes ridge; "
-            "each season uses only prior seasons for fitting"
+        "label_policy": args.label_policy,
+        "label_action_counts": dict(
+            Counter(example.action_id for example in all_examples)
         ),
+        "label_paid_hit_actions": sum(
+            1 for example in all_examples if example.action.hit_cost > 0.0
+        ),
+        "label_multi_transfer_actions": sum(
+            1 for example in all_examples if example.action.transfer_count > 1
+        ),
+        "feature_cache": feature_cache_description,
         "development_examples": len(development_examples),
         "validation_examples": len(validation_examples),
         "context": context_store.summary() if context_store is not None else {"events": 0},
+        "observed_manager_benchmark": observed_manager_summary,
         "availability_forecast_quality": availability_quality,
         "candidate_validation_scores": validation_scores,
         "selected_candidate": selected_name,
@@ -519,9 +634,11 @@ def main() -> None:
         "validation_neural": validation_neural,
         "validation_anchor": validation_anchor,
         "validation_cocktail": validation_cocktail,
+        "validation_patient_chips": validation_patient_chips,
         "test_neural": test_neural,
         "test_anchor": test_anchor,
         "test_cocktail": test_cocktail,
+        "test_patient_chips": test_patient_chips,
         "training_chip_depth": args.training_chip_depth,
         "test_chip_depth": args.test_chip_depth,
         "warnings": [

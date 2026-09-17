@@ -23,7 +23,7 @@ from .decision import (
 )
 from .league import HYBRID_PROFILES
 from .policy import ActionValueEnsemble, ActionValueMLP, PolicyAction, PolicyState
-from .simulator import CHIP_KINDS, recommendation_to_policy_action
+from .simulator import CHIP_KINDS, available_chip_kinds, chip_kind, recommendation_to_policy_action
 
 
 NEURAL_TYPES = (ActionValueMLP, ActionValueEnsemble)
@@ -637,7 +637,7 @@ def recommend_live_moves(
     if len(current) != 15:
         raise ValueError(f"current_squad must contain exactly 15 players; received {len(current)}")
     available_chips = set(CHIP_KINDS if chips_available is None else chips_available)
-    unknown_chips = available_chips - set(CHIP_KINDS)
+    unknown_chips = {chip for chip in available_chips if chip_kind(chip) is None}
     if unknown_chips:
         raise ValueError(f"unknown chips: {sorted(unknown_chips)}")
     signal_by_id = {signal.player_id: signal for signal in signal_rows}
@@ -715,11 +715,11 @@ def recommend_live_moves(
         rank_percentile=0.5,
         target_rank_percentile=0.5,
         rank_mode="neutral",
-        chip_flexibility=len(available_chips) / len(CHIP_KINDS),
-        wildcard_available="wildcard" in available_chips,
-        free_hit_available="free_hit" in available_chips,
-        bench_boost_available="bench_boost" in available_chips,
-        triple_captain_available="triple_captain" in available_chips,
+        chip_flexibility=min(1.0, len(available_chips) / len(CHIP_KINDS)),
+        wildcard_available="wildcard" in available_chip_kinds(available_chips, int(gameweek)),
+        free_hit_available="free_hit" in available_chip_kinds(available_chips, int(gameweek)),
+        bench_boost_available="bench_boost" in available_chip_kinds(available_chips, int(gameweek)),
+        triple_captain_available="triple_captain" in available_chip_kinds(available_chips, int(gameweek)),
         squad_minutes_probability=squad_minutes_probability,
         squad_news_risk=squad_news_risk,
         squad_context_reliability=squad_context_reliability,
@@ -733,8 +733,9 @@ def recommend_live_moves(
             for recommendation in recommendations
         ],
     ]
+    usable_chip_kinds = available_chip_kinds(available_chips, int(gameweek))
     for chip in CHIP_KINDS:
-        if chip not in available_chips:
+        if chip not in usable_chip_kinds:
             continue
         chip_action, chip_meta = _live_chip_action(
             chip,

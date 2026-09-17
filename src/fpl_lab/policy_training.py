@@ -112,11 +112,16 @@ def counterfactual_target_values(
     return targets
 
 
-def _action_id(action: PolicyAction) -> str:
+def _action_id(action: PolicyAction, transfer_bundle: Iterable | None = None) -> str:
     if action.kind == "hold":
         return "hold"
     if action.kind in CHIP_KINDS:
         return action.kind
+    bundle = tuple(transfer_bundle or ())
+    if len(bundle) > 1:
+        return "transfer_bundle:" + "|".join(
+            f"{item.player_out_id}>{item.player_in_id}" for item in bundle
+        )
     return f"transfer:{action.player_out_id}>{action.player_in_id}"
 
 
@@ -271,7 +276,7 @@ def collect_counterfactual_examples(
                     behavior_policy=behavior_policy,
                     gameweek=gameweek,
                     decision_time=row.get("decision_time"),
-                    action_id=_action_id(candidate.action),
+                    action_id=_action_id(candidate.action, candidate.transfer_bundle),
                     state=state,
                     action=candidate.action,
                     realized_value=realized_value,

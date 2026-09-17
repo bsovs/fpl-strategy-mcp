@@ -607,7 +607,7 @@ def _official_signal_rows(
 
 def _state_from_arguments(arguments: dict[str, Any]):
     from fpl_lab.decision import DecisionConfig, PlayerSignal, PlayerState
-    from fpl_lab.simulator import CHIP_KINDS
+    from fpl_lab.simulator import CHIP_KINDS, chip_kind
 
     payload = arguments.get("state", arguments)
     if not isinstance(payload, dict):
@@ -727,11 +727,18 @@ def _state_from_arguments(arguments: dict[str, Any]):
         used_chips = payload.get("chips_used", [])
         if not isinstance(used_chips, list):
             raise ValueError("chips_used must be a list when supplied")
-        chips_payload = sorted(set(CHIP_KINDS) - {str(chip) for chip in used_chips})
+        used_kinds = {
+            chip_kind(str(chip))
+            for chip in used_chips
+            if chip_kind(str(chip)) is not None
+        }
+        chips_payload = sorted(set(CHIP_KINDS) - used_kinds)
     if not isinstance(chips_payload, list):
         raise ValueError("chips_available must be a list when supplied")
     chips_available = [str(chip) for chip in chips_payload]
-    unknown_chips = set(chips_available) - set(CHIP_KINDS)
+    unknown_chips = {
+        chip for chip in chips_available if chip_kind(chip) is None
+    }
     if unknown_chips:
         raise ValueError(f"unknown chips: {sorted(unknown_chips)}")
     return {

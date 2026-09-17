@@ -1,11 +1,13 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 
 from fpl_lab.backtest import paired_match_bootstrap, run_temporal_backtest
+from fpl_lab.benchmark_forecast import BENCHMARK_FEATURES, build_benchmark_feature_table
 from fpl_lab.context import ContextStore, bootstrap_news_events
 from fpl_lab.data import Match, load_matches, to_team_observations
 from fpl_lab.decision import DecisionConfig, PlayerSignal, PlayerState, recommend_transfers
@@ -14,8 +16,12 @@ from fpl_lab.player_models import build_extended_player_feature_table, build_pla
 from fpl_lab.official_archive import OfficialSnapshotStore
 from fpl_lab.policy import ActionValueEnsemble, ActionValueMLP, PolicyAction, PolicyState, encode_state_action
 from fpl_lab.simulator import (
+    available_chip_kinds,
     build_model_signal_cache,
     build_season_data,
+    chip_token_for_use,
+    chip_tokens_for_season,
+    _choose_patient_chip,
     recommendation_to_policy_action,
     season_rules,
     selling_price_tenths,
@@ -147,6 +153,38 @@ class FplLabTests(unittest.TestCase):
         self.assertTrue(pd.isna(opening["total_points_last"]))
         self.assertEqual(opening["career_total_points_last"], 9)
         self.assertEqual(opening["career_games_before"], 1)
+
+    def test_benchmark_forecast_features_are_lagged_and_have_full_contract(self):
+        rows = []
+        for season, year in (("2023-24", 2023), ("2024-25", 2024)):
+            for gameweek in range(1, 4):
+                for element, position, team in ((1, "MID", 1), (2, "FWD", 2)):
+                    rows.append(
+                        {
+                            "season": season,
+                            "gameweek": gameweek,
+                            "element": element,
+                            "name": f"Player {element}",
+                            "position": position,
+                            "team": team,
+                            "opponent_team": 3 - team,
+                            "kickoff_time": f"{year}-08-{gameweek:02d}T12:00:00Z",
+                            "was_home": True,
+                            "fixture": gameweek,
+                            "total_points": gameweek,
+                            "minutes": 90,
+                            "value": 50,
+                            "selected": 100,
+                            "transfers_balance": 0,
+                            "starts": 1,
+                        }
+                    )
+        features = build_benchmark_feature_table(pd.DataFrame(rows))
+        self.assertTrue(set(BENCHMARK_FEATURES).issubset(features.columns))
+        first = features[(features["season"] == "2023-24") & (features["round"] == 1)]
+        self.assertTrue(first["total_points_r3"].isna().all())
+        next_season = features[(features["season"] == "2024-25") & (features["round"] == 1)]
+        self.assertTrue(next_season["prev_points"].notna().all())
 
     def test_model_signal_cache_sums_double_gameweek_forecasts(self):
         raw = pd.DataFrame(
@@ -629,6 +667,29 @@ class FplLabTests(unittest.TestCase):
     def test_historical_free_transfer_caps(self):
         self.assertEqual(season_rules("2023-24").free_transfer_cap, 2)
         self.assertEqual(season_rules("2024-25").free_transfer_cap, 5)
+
+    def test_season_versioned_chip_inventory(self):
+        self.assertEqual(len(chip_tokens_for_season("2023-24")), 4)
+        chips = chip_tokens_for_season("2025-26")
+        self.assertEqual(len(chips), 8)
+        self.assertEqual(available_chip_kinds(chips, 10), set(["wildcard", "free_hit", "bench_boost", "triple_captain"]))
+        self.assertEqual(available_chip_kinds(chips, 20), set(["wildcard", "free_hit", "bench_boost", "triple_captain"]))
+        self.assertEqual(chip_token_for_use(chips, "wildcard", 10), "wildcard_1")
+        self.assertEqual(chip_token_for_use(chips, "wildcard", 20), "wildcard_2")
+
+    def test_patient_chip_challenger_forces_end_of_half_chip_slots(self):
+        def chip_value(chip, *_args):
+            return (8.0 if chip == "triple_captain" else 5.0, 0.0)
+
+        with patch("fpl_lab.simulator._chip_forecast_deltas", side_effect=chip_value):
+            chosen = _choose_patient_chip(
+                None,
+                18,
+                [],
+                [],
+                ("bench_boost_1", "triple_captain_1"),
+            )
+        self.assertEqual(chosen, "triple_captain")
 
 
 if __name__ == "__main__":

@@ -209,7 +209,8 @@ PYTHONPATH=src python scripts/train_action_policy.py \
   --horizon-gameweeks 3 \
   --training-chip-depth 5 \
   --test-chip-depth 15 \
-  --forecast-model neural
+  --forecast-model neural \
+  --label-policy points_only
 ```
 
 When backdated archives are available, add `--news-context PATH` and/or
@@ -230,6 +231,66 @@ opening of 2,156. The free-transfer anchor averaged 2,008.5 and peaked at
 the anchor in this replay, but the best result is still 257 points below the
 2,413 research target. This remains a research artifact, not a promoted
 champion.
+
+The latest corrected-rules replay is saved under
+`runs/action-policy-official-snapshot-v4-season-chips/`. It uses development
+seasons 2016/17–2023/24, validation on 2024/25, and a completely untouched
+2025/26 test. It fixes a major simulator defect by using the season-specific
+2025/26 eight-token chip inventory and half-season chip gates. The corrected
+2025/26 neural policy averaged 1,969.5 points across the four opening families
+(best 2,053), versus 1,983.75 for the no-hit free-transfer anchor (best 2,129).
+The cocktail averaged 1,997.5 (best 2,069). The corrected run is now the
+authoritative corrected-rules baseline; it is below the 2,413 target and is
+not a promoted champion. The later external-style candidate is reported
+separately below. The earlier v3 hit-aware result was an ablation under the
+old one-copy chip inventory and must not be used as the final 2025/26 score.
+
+The public [fpl-luck-or-skill challenger](https://github.com/zakariae-boui/fpl-luck-or-skill)
+reports 2,431 points from a patient, no-hit, use-it-or-lose-it TC/BB policy.
+The local simulator now contains that policy as `patient_chips`, but the
+neural/context replication scored 1,928.25 on average on the untouched
+2025/26 openings (best 1,955). The external number is therefore a useful
+benchmark and hypothesis, not a locally verified result; see the data-quality
+audit for the exact reproducibility limitation and artifact path.
+
+### External-style forecast and forecast-optimized opening
+
+The repo now includes a Mac-compatible `external_hgb` forecast family. It
+reproduces the public challenger's minutes-plus-conditional-points design with
+53 leakage-safe features: player form, minutes/start security, xG/xA, price,
+ownership, transfer momentum, true fixture team, opponent/team form, and
+previous-season production. It uses histogram gradient boosting locally, so it
+does not require the external LightGBM/OpenMP runtime.
+
+Run the strict walk-forward candidate with:
+
+```sh
+PYTHONPATH=src python scripts/train_action_policy.py \
+  --history-root /path/to/fpl-history \
+  --validation-season 2024-25 \
+  --evaluation-season 2025-26 \
+  --forecast-model external_hgb \
+  --starting-modes forecast \
+  --label-policy points_only \
+  --output-dir runs/action-policy-external-hgb-forecast-v1
+```
+
+The resulting artifact is `runs/action-policy-external-hgb-forecast-v1/metrics.json`.
+On the untouched 2025/26 test it scored:
+
+| Policy | Points | Transfers | Hits |
+|---|---:|---:|---:|
+| Neural action policy | 2,160 | 62 | 0 |
+| Free-transfer anchor | 2,338 | 37 | 0 |
+| Cocktail | 2,442 | 53 | 0 |
+| **Patient chips candidate** | **2,486** | **37** | **0** |
+
+The patient candidate clears the 2,413 target in this strict held-out replay.
+Its 2024/25 validation score was 2,357, so the opening rule was checked on a
+prior season before the final test was read. This is the strongest current
+research candidate, not yet the shipped MCP champion: it is one held-out
+season, the external benchmark is not independently reproduced byte-for-byte,
+and the exact historical elite-manager alternative archive remains incomplete.
 
 The context files are optional. Each event must carry a publication timestamp;
 archived events also carry the snapshot `observed_at` timestamp. The live
@@ -259,9 +320,73 @@ pre-fix temporal grain and is not comparable to the clean result above. The
 direct-horizon neural and price-aware variants are retained as inspectable
 research outputs; they are not evidence of a winning strategy by themselves.
 
-The optional `--starting-modes ... forecast` stress test adds a legal
-forecast-optimized opening squad. It reached 2,162 points on 2025/26, below
-the four-family ridge result, so it is not part of the default benchmark.
+The optional `--starting-modes ... forecast` mode adds a legal
+forecast-optimized opening squad. Under the older neural/ridge bridge it
+reached 2,162 points on 2025/26 and was not promoted. The newer
+`external_hgb` replay above is a separate, validation-approved forecast
+candidate and should not be conflated with that older ablation.
+
+The hit-aware replay is saved under
+`runs/action-policy-official-snapshot-v3-hit-aware/`. It generated 165 paid-hit
+and 453 multi-transfer counterfactual actions. On untouched 2025/26, its
+neural policy averaged 1,986 points (best opening 2,114), versus 1,983.75
+(best 2,129) for the no-hit anchor. This is a useful coverage fix and a
+negative strategy result under the pre-chip-fix simulator. The corrected-rule
+follow-up is v4 above.
+
+## Observed elite-manager benchmark
+
+The repo also includes a provenance-tracked aggregate benchmark from a public
+archive of 24,041 complete 2025/26 manager seasons under
+`data/elite_managers/`. It includes transfer gain, transfer count, hits,
+captain agreement, chip usage, and transfer timing by manager rank band. To
+inspect the observed behavior profile locally:
+
+```sh
+PYTHONPATH=src python scripts/analyze_elite_managers.py \
+  --autopsy data/elite_managers/autopsy_all.csv \
+  --output runs/elite-manager-benchmark/summary.json
+```
+
+To inspect the pre-deadline conditions around observed transfers, including
+recent points/minutes, price, ownership, transfer momentum, and a separate
+forward-outcome audit:
+
+```sh
+PYTHONPATH=src python scripts/analyze_observed_manager_decisions.py \
+  --history-root /path/to/fpl-history \
+  --output runs/elite-manager-benchmark/decision-audit.json
+```
+
+The top-100 band has a median 325-point net transfer gain, 62 transfers, 4
+hits, 0 unused chips, 71.1% captain agreement, and 17 hours' median timing;
+the top-10k band has a median 302-point transfer gain, 63 transfers, 4 hits,
+0 unused chips, and 79.0% captain agreement. These are descriptive
+benchmarks, not causal labels. The shipped loader deliberately excludes final
+rank and final points from behavior features. The aggregate table cannot yet
+identify exact weekly alternatives. The detailed 2025/26 weekly archive is now present under
+`data/elite_managers/season_winners_2025-26/` and is held out from training.
+Pre-2025/26 weekly manager archives are still needed for leakage-safe direct
+imitation or inverse-decision modeling. The local 2025/26 decision audit found
+that top-100 managers bought players with a higher prior three-gameweek point
+rate (13.15 versus 12.61 for players sold), slightly lower prior three-
+gameweek minutes (216.9 versus 223.7), lower prior ownership, and stronger
+positive transfer momentum. The following-three-gameweek points are retained
+only as a quarantined outcome audit, never as model features.
+
+To fit descriptive, leakage-audited behavior heads for transfer/hold,
+bundles, paid hits, chips, and incoming-versus-outgoing player signals:
+
+```sh
+PYTHONPATH=src python scripts/reverse_engineer_observed_actions.py \
+  --history-root /path/to/fpl-history \
+  --output runs/elite-manager-benchmark/action-heads.json
+```
+
+See [observed action heads](docs/observed-action-heads.md) for the measured
+behavior metrics and the data needed before these heads can train on older
+seasons. The `patient_chips` simulator challenger is also documented there;
+it is not the promoted policy.
 
 ## Data coverage and missing signals
 
@@ -274,11 +399,13 @@ and model selection.
 
 The important gaps are contextual rather than raw player rows. The public
 snapshot archive now supplies official news/availability and set-piece
-intervals, but it does not provide a complete timestamped expected-minutes
-history, press-conference/predicted-lineup/social stream, richer historical
-fixture-strength feed, or real rival-manager actions. The pipeline has a
-leakage-safe expected-minutes model and a full official-context ablation, but
-neither is currently a validated strategy improvement. The oldest gameweek
+intervals, and `data/elite_managers/` supplies an aggregate observed-manager
+benchmark. We still do not have each elite manager's exact point-in-time
+alternative set wired into action labels, nor a complete timestamped
+expected-minutes history, press-conference/predicted-lineup/social stream, or
+richer historical fixture-strength feed. The pipeline has a leakage-safe
+expected-minutes model and a full official-context ablation, but neither is
+currently a validated strategy improvement. The oldest gameweek
 files also need season-level roster snapshots to fill team/position metadata;
 those rows are flagged and are not treated as point-in-time transfer history.
 News/social signals require an explicitly supplied timestamped context archive
